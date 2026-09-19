@@ -1,12 +1,12 @@
-name: Build Tiny Linux
+name: Build Tiny Linux (persistent rootfs)
 
 on:
-  workflow_dispatch:        # 手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -16,8 +16,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison bc \
-            libssl-dev libelf-dev libncurses-dev cpio wget xz-utils
+            libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
+            e2fsprogs
 
+      # ---------- 内核 ----------
       - name: Download kernel
         run: |
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.1.tar.xz
@@ -30,6 +32,14 @@ jobs:
           scripts/config --disable MODULE_SIG
           scripts/config --disable SYSTEM_TRUSTED_KEYS
           scripts/config --disable SYSTEM_REVOCATION_KEYS
+          # 确保 ext4 和 virtio 是内建的（不是模块）
+          scripts/config --enable EXT4_FS
+          scripts/config --enable VIRTIO
+          scripts/config --enable VIRTIO_PCI
+          scripts/config --enable VIRTIO_BLK
+          scripts/config --enable VIRTIO_NET
+          scripts/config --enable DEVTMPFS
+          scripts/config --enable DEVTMPFS_MOUNT
           make olddefconfig
 
       - name: Build kernel
@@ -37,6 +47,7 @@ jobs:
           cd linux-6.6.1
           make -j$(nproc) bzImage
 
+      # ---------- BusyBox ----------
       - name: Download busybox
         run: |
           wget -q https://busybox.net/downloads/busybox-1.36.1.tar.bz2
@@ -47,34 +58,66 @@ jobs:
           cd busybox-1.36.1
           make defconfig
           sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
           make oldconfig
           make -j$(nproc)
           make install
 
-      - name: Make initramfs
+      # ---------- rootfs.img ----------
+      - name: Build rootfs image
         run: |
-          mkdir -p initramfs
-          cp -a busybox-1.36.1/_install/* initramfs/
-          mkdir -p initramfs/{proc,sys,dev,tmp,etc,root}
-          cat > initramfs/init <<'EOF'
+          set -e
+
+          # 64MB 空镜像
+          dd if=/dev/zero of=rootfs.img bs=1M count=64
+
+          # 格式化 ext4
+          mkfs.ext4 -F rootfs.img
+
+          # 挂载到临时目录
+          sudo mkdir -p /mnt/rootfs
+          sudo mount -o loop rootfs.img /mnt/rootfs
+
+          # 复制 BusyBox 用户空间
+          sudo cp -a busybox-1.36.1/_install/* /mnt/rootfs/
+
+          # 建必要目录
+          sudo mkdir -p /mnt/rootfs/{proc,sys,dev,tmp,root,etc,var,home}
+          sudo mkdir -p /mnt/rootfs/usr/share/udhcpc
+
+          # 装上 udhcpc 脚本（这样 DHCP 能自动配 IP）
+          sudo cp busybox-1.36.1/examples/udhcp/simple.script \
+                  /mnt/rootfs/usr/share/udhcpc/default.script
+          sudo chmod +x /mnt/rootfs/usr/share/udhcpc/default.script
+
+          # 删掉 BusyBox 自带的 /sbin/init 软链
+          sudo rm -f /mnt/rootfs/sbin/init
+
+          # 写我们自己的 init
+          sudo tee /mnt/rootfs/sbin/init > /dev/null <<'INITEOF'
           #!/bin/sh
           mount -t proc none /proc
           mount -t sysfs none /sys
           mount -t devtmpfs devtmpfs /dev
           echo
-          echo "Welcome to Tiny Linux"
+          echo "Welcome to Tiny Linux (persistent)"
           echo
           exec /bin/sh
-          EOF
-          chmod +x initramfs/init
-          cd initramfs
-          find . -print0 | cpio --null -o --format=newc | gzip -9 > ../initramfs.cpio.gz
+          INITEOF
+          sudo chmod +x /mnt/rootfs/sbin/init
 
+          # 写个 /etc/resolv.conf 占位（udhcpc 会覆盖）
+          echo "nameserver 10.0.2.3" | sudo tee /mnt/rootfs/etc/resolv.conf > /dev/null
+
+          # 卸载
+          sudo umount /mnt/rootfs
+
+      # ---------- 打包 ----------
       - name: Collect artifacts
         run: |
           mkdir -p out
           cp linux-6.6.1/arch/x86/boot/bzImage out/
-          cp initramfs.cpio.gz out/
+          cp rootfs.img out/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -12,30 +12,34 @@ jobs:
       - name: Install deps
         run: |
           apk update
-          apk add build-base git autoconf automake libtool pkgconfig \
-                  libarchive-dev openssl-dev zlib-dev
+          apk add build-base cmake git libarchive-dev openssl-dev zlib-dev
 
       - name: Clone opkg
         run: |
           git clone https://git.openwrt.org/project/opkg-lede.git
-          cd opkg-lede
 
       - name: Build static opkg
         run: |
           cd opkg-lede
-          ./autogen.sh
-          # 关键配置：禁用动态库，禁用 curl (让它用系统的 wget)，禁用 gpg
-          ./configure \
-            --disable-shared \
-            --enable-static \
-            --disable-curl \
-            --disable-gpg \
-            --prefix=/usr
-          # LDFLAGS=-static 强制静态链接 libarchive 和 libc
-          make LDFLAGS="-static -all-static" -j$(nproc)
+          mkdir build && cd build
+          # 使用 CMake 配置，强制静态链接，关闭不需要的 curl 和 gpg
+          cmake .. \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DWITH_CURL=OFF \
+            -DWITH_GPG=OFF
+          make -j$(nproc)
+
+      - name: Find and Copy binary
+        run: |
+          cd opkg-lede
+          # 找到编译出来的 opkg 文件并复制出来
+          find . -name opkg -type f -executable -exec cp {} ./opkg \;
+          ls -lh opkg
 
       - name: Upload opkg
         uses: actions/upload-artifact@v4
         with:
           name: opkg-static
-          path: opkg-lede/src/opkg
+          path: opkg-lede/opkg

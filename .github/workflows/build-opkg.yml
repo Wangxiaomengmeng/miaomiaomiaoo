@@ -12,7 +12,28 @@ jobs:
       - name: Install deps
         run: |
           apk update
-          apk add build-base cmake git libarchive-dev openssl-dev zlib-dev
+          apk add build-base cmake git libarchive-dev openssl-dev \
+                  zlib-dev json-c-dev
+
+      - name: Clone libubox
+        run: |
+          git clone https://git.openwrt.org/project/libubox.git
+
+      - name: Build libubox static
+        run: |
+          cd libubox
+          mkdir build && cd build
+          cmake .. \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_LUA=OFF \
+            -DBUILD_EXAMPLES=OFF
+          make -j$(nproc)
+          make install
+          ls -l /usr/lib/libubox.a
+          ls -l /usr/include/libubox/
 
       - name: Clone opkg
         run: |
@@ -22,23 +43,22 @@ jobs:
         run: |
           cd opkg-lede
           mkdir build && cd build
-          # 加上 CMAKE_POLICY_VERSION_MINIMUM 兼容旧脚本，同时关掉 BUILD_TESTING
           cmake .. \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DWITH_CURL=OFF \
-            -DWITH_GPG=OFF \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-            -DBUILD_TESTING=OFF
+            -DCMAKE_PREFIX_PATH=/usr \
+            -Dubox_LIBRARY=/usr/lib/libubox.a \
+            -Dubox_INCLUDE_DIR=/usr/include
           make -j$(nproc)
 
-      - name: Find and Copy binary
+      - name: Copy binary
         run: |
           cd opkg-lede
-          # 找到编译出来的 opkg 文件并复制出来
           find . -name opkg -type f -executable -exec cp {} ./opkg \;
           ls -lh opkg
+          file opkg || true
 
       - name: Upload opkg
         uses: actions/upload-artifact@v4

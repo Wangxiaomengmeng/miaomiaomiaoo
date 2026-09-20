@@ -18,20 +18,20 @@ jobs:
         run: |
           git clone https://git.openwrt.org/project/opkg-lede.git
 
- - name: Build static opkg
-  run: |
-    cd opkg-lede
-    mkdir build && cd build
-    # 加上 CMAKE_POLICY_VERSION_MINIMUM 兼容旧脚本，同时关掉 BUILD_TESTING
-    cmake .. \
-      -DBUILD_SHARED_LIBS=OFF \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_EXE_LINKER_FLAGS="-static" \
-      -DWITH_CURL=OFF \
-      -DWITH_GPG=OFF \
-      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-      -DBUILD_TESTING=OFF
-    make -j$(nproc)
+      - name: Build static opkg
+        run: |
+          cd opkg-lede
+          mkdir build && cd build
+          # 加上 CMAKE_POLICY_VERSION_MINIMUM 兼容旧脚本，同时关掉 BUILD_TESTING
+          cmake .. \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DWITH_CURL=OFF \
+            -DWITH_GPG=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_TESTING=OFF
+          make -j$(nproc)
 
       - name: Find and Copy binary
         run: |

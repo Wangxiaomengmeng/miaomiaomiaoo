@@ -32,12 +32,20 @@ jobs:
             -DBUILD_EXAMPLES=OFF
           make -j$(nproc)
           make install
+          # 关键：删掉共享库，只留静态库
+          rm -f /usr/lib/libubox.so*
           ls -l /usr/lib/libubox.a
-          ls -l /usr/include/libubox/
 
       - name: Clone opkg
         run: |
           git clone https://git.openwrt.org/project/opkg-lede.git
+
+      - name: Disable tests
+        run: |
+          cd opkg-lede
+          # 注释掉 tests 子目录，避免链接错误
+          sed -i 's/^add_subdirectory(tests)/# add_subdirectory(tests)/' CMakeLists.txt
+          grep -n "add_subdirectory" CMakeLists.txt
 
       - name: Build static opkg
         run: |

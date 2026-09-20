@@ -1,0 +1,41 @@
+name: Build Static Opkg
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-opkg:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install deps
+        run: |
+          apk update
+          apk add build-base git autoconf automake libtool pkgconfig \
+                  libarchive-dev openssl-dev zlib-dev
+
+      - name: Clone opkg
+        run: |
+          git clone https://git.openwrt.org/project/opkg-lede.git
+          cd opkg-lede
+
+      - name: Build static opkg
+        run: |
+          cd opkg-lede
+          ./autogen.sh
+          # 关键配置：禁用动态库，禁用 curl (让它用系统的 wget)，禁用 gpg
+          ./configure \
+            --disable-shared \
+            --enable-static \
+            --disable-curl \
+            --disable-gpg \
+            --prefix=/usr
+          # LDFLAGS=-static 强制静态链接 libarchive 和 libc
+          make LDFLAGS="-static -all-static" -j$(nproc)
+
+      - name: Upload opkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: opkg-static
+          path: opkg-lede/src/opkg

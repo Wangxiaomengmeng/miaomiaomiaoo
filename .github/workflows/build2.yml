@@ -1,0 +1,198 @@
+name: Build Tiny Linux for Real Hardware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison bc \
+            libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
+            e2fsprogs
+
+      # ---------- BusyBox ----------
+      - name: Download busybox
+        run: |
+          wget -q https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+          tar -xf busybox-1.36.1.tar.bz2
+
+      - name: Build busybox static
+        run: |
+          cd busybox-1.36.1
+          make defconfig
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          make oldconfig
+          make -j$(nproc)
+          make install
+
+      # ---------- 嵌入式 initramfs ----------
+      - name: Build embedded initramfs
+        run: |
+          mkdir -p initramfs/{bin,dev,proc,sys,mnt,realroot}
+          cp busybox-1.36.1/_install/bin/busybox initramfs/bin/
+
+          cd initramfs/bin
+          for c in sh mount umount sleep ls cat mkdir ln; do
+            ln -sf busybox $c
+          done
+          cd ../..
+
+          cat > initramfs/init <<'INITEOF'
+          #!/bin/busybox sh
+          /bin/busybox mount -t proc none /proc
+          /bin/busybox mount -t sysfs none /sys
+          /bin/busybox mount -t devtmpfs devtmpfs /dev
+
+          echo
+          echo "=== Tiny Linux initramfs ==="
+          echo "Looking for U disk with rootfs.img..."
+          /bin/busybox sleep 2
+
+          UDISK=""
+          for dev in /dev/sda1 /dev/sda /dev/sdb1 /dev/sdb /dev/sdc1 /dev/sdc; do
+              [ -b "$dev" ] || continue
+              if /bin/busybox mount -t vfat "$dev" /mnt 2>/dev/null; then
+                  if [ -f /mnt/rootfs.img ]; then
+                      UDISK="$dev"
+                      echo "Found rootfs.img on $dev"
+                      break
+                  fi
+                  /bin/busybox umount /mnt 2>/dev/null
+              fi
+          done
+
+          if [ -z "$UDISK" ]; then
+              echo "ERROR: no U disk with rootfs.img found"
+              echo "Available block devices:"
+              /bin/busybox ls /dev/sd* /dev/nvme* 2>/dev/null
+              exec /bin/busybox sh
+          fi
+
+          echo "Mounting rootfs.img..."
+          /bin/busybox mount -o loop /mnt/rootfs.img /realroot || {
+              echo "ERROR: failed to mount rootfs.img"
+              exec /bin/busybox sh
+          }
+
+          echo "Switching root..."
+          exec /bin/busybox switch_root /realroot /sbin/init
+          INITEOF
+
+          chmod +x initramfs/init
+
+      # ---------- 内核 ----------
+      - name: Download kernel
+        run: |
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.1.tar.xz
+          tar -xf linux-6.6.1.tar.xz
+
+      - name: Configure kernel
+        run: |
+          cd linux-6.6.1
+          make defconfig
+          scripts/config --disable MODULE_SIG
+          scripts/config --disable SYSTEM_TRUSTED_KEYS
+          scripts/config --disable SYSTEM_REVOCATION_KEYS
+
+          # 存储：loop + NVMe + SATA
+          scripts/config --enable BLK_DEV_LOOP
+          scripts/config --enable BLK_DEV_NVME
+          scripts/config --enable NVME_CORE
+          scripts/config --enable SATA_AHCI
+
+          # USB：控制器 + HID + 存储
+          scripts/config --enable USB_SUPPORT
+          scripts/config --enable USB_XHCI_HCD
+          scripts/config --enable USB_EHCI_HCD
+          scripts/config --enable USB_HID
+          scripts/config --enable USB_STORAGE
+
+          # 显卡：Intel 核显 + EFI framebuffer
+          scripts/config --enable DRM
+          scripts/config --enable DRM_I915
+          scripts/config --enable DRM_FBDEV_EMULATION
+          scripts/config --enable FB
+          scripts/config --enable FB_EFI
+
+          # 网卡：B760M 常见 RTL8125
+          scripts/config --enable R8169
+
+          # 文件系统
+          scripts/config --enable EXT4_FS
+          scripts/config --enable VFAT_FS
+
+          # UEFI
+          scripts/config --enable EFI
+          scripts/config --enable EFI_STUB
+          scripts/config --enable EFI_PARTITION
+
+          # 嵌入 initramfs
+          scripts/config --enable BLK_DEV_INITRD
+          scripts/config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/initramfs"
+
+          # 嵌入内核命令行
+          scripts/config --enable CMDLINE_BOOL
+          scripts/config --set-str CMDLINE "rdinit=/init console=tty0 loglevel=7"
+          scripts/config --enable CMDLINE_OVERRIDE
+
+          make olddefconfig
+
+      - name: Build kernel
+        run: |
+          cd linux-6.6.1
+          make -j$(nproc) bzImage
+
+      # ---------- rootfs.img ----------
+      - name: Build rootfs image
+        run: |
+          set -e
+          dd if=/dev/zero of=rootfs.img bs=1M count=256
+          mkfs.ext4 -F rootfs.img
+          sudo mkdir -p /mnt/rootfs
+          sudo mount -o loop rootfs.img /mnt/rootfs
+
+          sudo cp -a busybox-1.36.1/_install/* /mnt/rootfs/
+          sudo mkdir -p /mnt/rootfs/{proc,sys,dev,tmp,root,etc,var,home,lib,usr/lib,usr/bin}
+          sudo chown -R 0:0 /mnt/rootfs
+          sudo chmod u+s /mnt/rootfs/bin/busybox
+
+          sudo rm -f /mnt/rootfs/sbin/init
+          sudo tee /mnt/rootfs/sbin/init > /dev/null <<'INITEOF'
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+
+          ip link set eth0 up 2>/dev/null
+          udhcpc -i eth0 -q -n -t 3 2>/dev/null
+
+          echo
+          echo "Welcome to Tiny Linux on Real Hardware"
+          echo
+          exec /bin/sh
+          INITEOF
+          sudo chmod +x /mnt/rootfs/sbin/init
+
+          sudo umount /mnt/rootfs
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp linux-6.6.1/arch/x86/boot/bzImage out/
+          cp rootfs.img out/
+          ls -lh out/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-linux-realhw
+          path: out/

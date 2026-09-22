@@ -1,0 +1,51 @@
+name: Check Disk Space
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  check-disk:
+    name: Check disk on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Show runner OS
+        run: echo "Runner OS is ${{ runner.os }}"
+
+      - name: Check disk on Linux
+        if: runner.os == 'Linux'
+        run: |
+          echo "=== df -h ==="
+          df -h
+          echo "=== root partition ==="
+          df -h /
+          echo "=== lsblk ==="
+          lsblk
+
+      - name: Check disk on macOS
+        if: runner.os == 'macOS'
+        run: |
+          echo "=== df -h ==="
+          df -h
+          echo "=== root partition ==="
+          df -h /
+
+      - name: Check disk on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "=== Get-PSDrive C ==="
+          Get-PSDrive C
+          Write-Host "=== fsutil volume diskfree C: ==="
+          fsutil volume diskfree C:

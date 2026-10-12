@@ -1,4 +1,4 @@
-name: Build Tiny Linux for QEMU with opkg
+name: Build Tiny Linux (locked root + integrity check)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     steps:
       - uses: actions/checkout@v4
@@ -29,11 +29,295 @@ jobs:
           make defconfig
           sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
           sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          sed -i 's/^CONFIG_SU=y/# CONFIG_SU is not set/' .config
+          sed -i 's/^CONFIG_FEATURE_SU=y/# CONFIG_FEATURE_SU is not set/' .config
           make oldconfig
           make -j$(nproc)
           make install
 
-      # ==================== 内核 ====================
+      # ==================== OpenWrt rootfs ====================
+      - name: Download OpenWrt rootfs
+        run: |
+          cd /tmp
+          wget -q -O owrt.tar.gz \
+            http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/openwrt-23.05.2-x86-64-rootfs.tar.gz
+          mkdir -p owrt
+          tar -xzf owrt.tar.gz -C owrt
+
+      # ==================== system.img ====================
+      - name: Build system image
+        run: |
+          set -e
+          dd if=/dev/zero of=system.img bs=1M count=256
+          mkfs.ext4 -F system.img
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop system.img /mnt/sys
+
+          sudo cp -a busybox-1.36.1/_install/* /mnt/sys/
+          sudo mkdir -p /mnt/sys/{proc,sys,dev,etc,sbin,bin,usr/bin,usr/lib,usr/share/udhcpc,var,lib,home,opt,root,tmp}
+          sudo mkdir -p /mnt/sys/home/user
+
+          sudo cp busybox-1.36.1/examples/udhcp/simple.script \
+                  /mnt/sys/usr/share/udhcpc/default.script
+          sudo chmod +x /mnt/sys/usr/share/udhcpc/default.script
+
+          # musl 库
+          sudo cp -a /tmp/owrt/lib/*.so* /mnt/sys/lib/ 2>/dev/null || true
+          sudo cp -a /tmp/owrt/usr/lib/*.so* /mnt/sys/usr/lib/ 2>/dev/null || true
+          sudo rm -f /mnt/sys/lib/ld-musl-x86_64.so.1
+          sudo ln -sf /lib/libc.so /mnt/sys/lib/ld-musl-x86_64.so.1
+
+          # opkg
+          sudo cp /tmp/owrt/usr/bin/opkg /mnt/sys/usr/bin/opkg
+          sudo chmod +x /mnt/sys/usr/bin/opkg
+
+          # 删 su
+          sudo find /mnt/sys -name su -type l -delete
+          sudo rm -f /mnt/sys/bin/su /mnt/sys/sbin/su /mnt/sys/usr/bin/su
+
+          # 账户：root 不能登录
+          sudo tee /mnt/sys/etc/passwd > /dev/null <<'EOF'
+          root:x:0:0:root:/root:/sbin/nologin
+          user:x:1000:1000:user:/home/user:/bin/sh
+          EOF
+
+          sudo tee /mnt/sys/etc/group > /dev/null <<'EOF'
+          root:x:0:
+          user:x:1000:
+          EOF
+
+          sudo tee /mnt/sys/etc/shadow > /dev/null <<'EOF'
+          root:*:0:0:99999:7:::
+          user:*:1000:0:99999:7:::
+          EOF
+          sudo chmod 600 /mnt/sys/etc/shadow
+
+          : > /mnt/sys/etc/securetty
+
+          sudo tee /mnt/sys/etc/profile > /dev/null <<'PROFILEEOF'
+          export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin
+          export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
+          export HOME=/home/user
+          export PS1='\u@\h:\w\$ '
+          PROFILEEOF
+
+          # opkg 装到 /data/opt
+          sudo mkdir -p /mnt/sys/etc/opkg
+          sudo tee /mnt/sys/etc/opkg.conf > /dev/null <<'OPKGEOF'
+          dest root /data/opt
+          dest ram /tmp
+          lists_dir ext /data/var/opkg-lists
+
+          src/gz openwrt_base http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/base
+          src/gz openwrt_packages http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/packages
+          src/gz openwrt_targets http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/packages
+          OPKGEOF
+
+          # /var 下可变目录软链到 /data
+          sudo rm -rf /mnt/sys/var/lock /mnt/sys/var/run /mnt/sys/var/log /mnt/sys/var/opkg-lists
+          sudo ln -sf /data/var/lock       /mnt/sys/var/lock
+          sudo ln -sf /data/var/run        /mnt/sys/var/run
+          sudo ln -sf /data/var/log        /mnt/sys/var/log
+          sudo ln -sf /data/var/opkg-lists /mnt/sys/var/opkg-lists
+
+          sudo rm -f /mnt/sys/etc/resolv.conf
+          sudo ln -sf /data/var/resolv.conf /mnt/sys/etc/resolv.conf
+
+          # /sbin/init（校验通过后才跑）
+          sudo rm -f /mnt/sys/sbin/init
+          sudo tee /mnt/sys/sbin/init > /dev/null <<'INITEOF'
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs devtmpfs /dev
+
+          hostname tinylinux
+
+          mkdir -p /data
+          mount /dev/vdb /data
+
+          mkdir -p /data/var/lock /data/var/run /data/var/log /data/var/opkg-lists \
+                   /data/opt /data/home/user /data/tmp
+          chown 1000:1000 /data/opt /data/home/user
+          chmod 777 /data/var/lock /data/var/run /data/var/log
+          chown 1000:1000 /data/var/opkg-lists
+          touch /data/var/resolv.conf
+          chmod 666 /data/var/resolv.conf
+
+          mount --bind /data/home /home
+          mount --bind /data/opt  /opt
+          mount -t tmpfs tmpfs /tmp
+          chmod 1777 /tmp
+
+          ip link set eth0 up 2>/dev/null
+          udhcpc -i eth0 -q -n -t 3 2>/dev/null
+
+          export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin
+          export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
+          export HOME=/home/user
+          export PS1='user@tinylinux:\w\$ '
+
+          echo
+          echo "Welcome to Tiny Linux (root disabled, integrity verified)"
+          echo
+
+          exec </dev/ttyS0 >/dev/ttyS0 2>&1
+          exec /bin/busybox setsid /bin/busybox setuidgid 1000 \
+               /bin/busybox cttyhack /bin/sh
+          INITEOF
+          sudo chmod +x /mnt/sys/sbin/init
+
+          sudo chown -R 0:0 /mnt/sys
+          sudo chown -R 1000:1000 /mnt/sys/home/user
+          sudo chmod u-s /mnt/sys/bin/busybox
+          sudo chmod u-s /mnt/sys/usr/bin/opkg
+
+          # ============ 生成完整性清单 ============
+          echo ">>> 生成 system integrity manifest..."
+          cd /mnt/sys
+          sudo find . -type f \
+              -not -path './proc/*' -not -path './sys/*' -not -path './dev/*' \
+              -not -path './tmp/*' -not -path './data/*' \
+              -not -path './var/run/*' -not -path './var/lock/*' \
+              -not -path './var/log/*' -not -path './var/opkg-lists/*' \
+              -not -path './home/*' -not -path './opt/*' -not -path './root/*' \
+              | LC_ALL=C sort | while read f; do
+              f2="${f#./}"
+              h=$(sudo sha256sum "$f" | cut -d' ' -f1)
+              echo "F $h /$f2"
+          done | sudo tee /tmp/system.manifest > /dev/null
+
+          sudo find . -type l \
+              -not -path './proc/*' -not -path './sys/*' -not -path './dev/*' \
+              -not -path './tmp/*' -not -path './data/*' \
+              -not -path './var/run' -not -path './var/lock' \
+              -not -path './var/log' -not -path './var/opkg-lists' \
+              -not -path './home' -not -path './opt' \
+              | LC_ALL=C sort | while read f; do
+              f2="${f#./}"
+              t=$(sudo readlink "$f")
+              echo "L $t /$f2"
+          done | sudo tee -a /tmp/system.manifest > /dev/null
+
+          echo "Manifest lines: $(wc -l < /tmp/system.manifest)"
+          head -5 /tmp/system.manifest
+
+          sudo umount /mnt/sys
+
+      # ==================== initramfs（内嵌校验逻辑）====================
+      - name: Build initramfs with verifier
+        run: |
+          set -e
+          rm -rf initramfs
+          mkdir -p initramfs/{bin,dev,proc,sys,mnt,sysroot,tmp}
+
+          cp busybox-1.36.1/_install/bin/busybox initramfs/bin/
+          cp /tmp/system.manifest initramfs/system.manifest
+
+          cd initramfs/bin
+          for c in sh mount umount sha256sum readlink grep cut sort diff find \
+                   cat echo sleep poweroff switch_root mkdir head cmp; do
+            ln -sf busybox $c
+          done
+          cd ../..
+
+          cat > initramfs/init <<'INITEOF'
+          #!/bin/busybox sh
+          /bin/busybox mount -t proc none /proc
+          /bin/busybox mount -t sysfs none /sys
+          /bin/busybox mount -t devtmpfs devtmpfs /dev
+
+          echo
+          echo "=== Tiny Linux Secure Boot ==="
+          echo "Mounting system (read-only)..."
+          if ! /bin/busybox mount -o ro /dev/vda /sysroot; then
+              echo "FATAL: cannot mount /dev/vda"
+              /bin/busybox sleep 3
+              /bin/busybox poweroff -f
+              while true; do /bin/busybox sleep 3600; done
+          fi
+
+          echo "Verifying integrity..."
+
+          FAIL=0
+
+          # 1) 逐文件 sha256 + 逐软链目标
+          while IFS=' ' read -r type val path; do
+              [ -z "$type" ] && continue
+              case "$type" in
+                  F)
+                      actual=$(/bin/busybox sha256sum "/sysroot$path" 2>/dev/null | /bin/busybox cut -d' ' -f1)
+                      if [ "$actual" != "$val" ]; then
+                          echo "  TAMPERED FILE: $path"
+                          FAIL=1
+                      fi
+                      ;;
+                  L)
+                      actual=$(/bin/busybox readlink "/sysroot$path" 2>/dev/null)
+                      if [ "$actual" != "$val" ]; then
+                          echo "  TAMPERED LINK: $path"
+                          FAIL=1
+                      fi
+                      ;;
+              esac
+          done < /system.manifest
+
+          # 2) 检测增删文件
+          cd /sysroot
+          /bin/busybox find . -type f \
+              -not -path './proc/*' -not -path './sys/*' -not -path './dev/*' \
+              -not -path './tmp/*' -not -path './data/*' \
+              -not -path './var/run/*' -not -path './var/lock/*' \
+              -not -path './var/log/*' -not -path './var/opkg-lists/*' \
+              -not -path './home/*' -not -path './opt/*' -not -path './root/*' \
+              | LC_ALL=C /bin/busybox sort > /tmp/current.list
+
+          /bin/busybox grep '^F ' /system.manifest \
+              | /bin/busybox cut -d' ' -f3 \
+              | /bin/busybox sed 's|^/|./|' \
+              | LC_ALL=C /bin/busybox sort > /tmp/expected.list
+
+          if ! /bin/busybox cmp -s /tmp/current.list /tmp/expected.list; then
+              echo "  EXTRA OR MISSING FILES:"
+              /bin/busybox diff /tmp/current.list /tmp/expected.list | /bin/busybox head -10
+              FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+              echo
+              echo "######################################"
+              echo "#  SYSTEM INTEGRITY CHECK FAILED     #"
+              echo "#  System has been tampered with.    #"
+              echo "#  REFUSING TO BOOT.                 #"
+              echo "#  SHUTTING DOWN.                    #"
+              echo "######################################"
+              echo
+              /bin/busybox sleep 5
+              /bin/busybox poweroff -f
+              # 死循环兜底，即使 poweroff 没生效也不会给 shell
+              while true; do /bin/busybox sleep 3600; done
+          fi
+
+          echo "Integrity OK."
+          echo
+
+          /bin/busybox mkdir -p /sysroot/data
+          /bin/busybox mount /dev/vdb /sysroot/data || echo "WARN: userdata mount failed"
+
+          /bin/busybox mount --move /proc /sysroot/proc
+          /bin/busybox mount --move /sys  /sysroot/sys
+          /bin/busybox mount --move /dev  /sysroot/dev
+
+          exec /bin/busybox switch_root /sysroot /sbin/init
+          INITEOF
+          chmod +x initramfs/init
+
+          echo ">>> initramfs contents:"
+          ls -la initramfs/
+          echo ">>> init is executable:"
+          ls -l initramfs/init
+
+      # ==================== 内核（嵌 initramfs）====================
       - name: Download kernel
         run: |
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.1.tar.xz
@@ -55,6 +339,20 @@ jobs:
           scripts/config --enable E1000
           scripts/config --enable DEVTMPFS
           scripts/config --enable DEVTMPFS_MOUNT
+
+          # 嵌入 initramfs
+          scripts/config --enable BLK_DEV_INITRD
+          scripts/config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/initramfs"
+
+          # 内嵌 cmdline，并覆盖外部参数（防 init=xxx 绕过）
+          scripts/config --enable CMDLINE_BOOL
+          scripts/config --set-str CMDLINE "rdinit=/init console=ttyS0 loglevel=7 panic=10"
+          scripts/config --enable CMDLINE_OVERRIDE
+
+          # 防止 initramfs 校验失败后 panic 重启绕过
+          scripts/config --enable PANIC_ON_OOPS
+          scripts/config --disable BOOTPARAM_SOFTLOCKUP_PANIC
+
           make olddefconfig
 
       - name: Build kernel
@@ -62,142 +360,7 @@ jobs:
           cd linux-6.6.1
           make -j$(nproc) bzImage
 
-      # ==================== 下载 OpenWrt rootfs（提取 musl + opkg）====================
-      - name: Download OpenWrt rootfs
-        run: |
-          cd /tmp
-          wget -q -O owrt.tar.gz \
-            http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/openwrt-23.05.2-x86-64-rootfs.tar.gz
-          mkdir -p owrt
-          tar -xzf owrt.tar.gz -C owrt
-          ls -l /tmp/owrt/usr/bin/opkg
-          ls -l /tmp/owrt/lib/
-
-      # ==================== system.img（只读系统）====================
-      - name: Build system image
-        run: |
-          set -e
-          dd if=/dev/zero of=system.img bs=1M count=256
-          mkfs.ext4 -F system.img
-          sudo mkdir -p /mnt/sys
-          sudo mount -o loop system.img /mnt/sys
-
-          # ---- BusyBox 用户空间 ----
-          sudo cp -a busybox-1.36.1/_install/* /mnt/sys/
-
-          # ---- 必要目录 ----
-          sudo mkdir -p /mnt/sys/{proc,sys,dev,etc,sbin,usr/bin,usr/lib,usr/share/udhcpc,var,lib,home,opt,root}
-
-          # ---- udhcpc 脚本（自动配 IP）----
-          sudo cp busybox-1.36.1/examples/udhcp/simple.script \
-                  /mnt/sys/usr/share/udhcpc/default.script
-          sudo chmod +x /mnt/sys/usr/share/udhcpc/default.script
-
-          # ---- musl 动态库（从 OpenWrt rootfs 抠）----
-          sudo cp -a /tmp/owrt/lib/*.so* /mnt/sys/lib/ 2>/dev/null || true
-          sudo cp -a /tmp/owrt/usr/lib/*.so* /mnt/sys/usr/lib/ 2>/dev/null || true
-
-          # ---- 修动态链接器软链（关键！musl 的 libc 就是链接器）----
-          sudo rm -f /mnt/sys/lib/ld-musl-x86_64.so.1
-          sudo ln -sf /lib/libc.so /mnt/sys/lib/ld-musl-x86_64.so.1
-
-          # ---- opkg 二进制 ----
-          sudo cp /tmp/owrt/usr/bin/opkg /mnt/sys/usr/bin/opkg
-          sudo chmod +x /mnt/sys/usr/bin/opkg
-
-          # ---- 用户账户 ----
-          sudo tee /mnt/sys/etc/passwd > /dev/null <<'EOF'
-          root:x:0:0:root:/root:/bin/sh
-          user:x:1000:1000:user:/home/user:/bin/sh
-          EOF
-
-          sudo tee /mnt/sys/etc/group > /dev/null <<'EOF'
-          root:x:0:
-          user:x:1000:
-          EOF
-
-          sudo tee /mnt/sys/etc/shadow > /dev/null <<'EOF'
-          root::0:0:99999:7:::
-          user::1000:0:99999:7:::
-          EOF
-          sudo chmod 600 /mnt/sys/etc/shadow
-
-          sudo tee /mnt/sys/etc/securetty > /dev/null <<'EOF'
-          ttyS0
-          tty1
-          console
-          EOF
-
-          # ---- /etc/profile：PATH 指向 /opt（user 装的东西放这里）----
-          sudo tee /mnt/sys/etc/profile > /dev/null <<'PROFILEEOF'
-          export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin
-          export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
-          export HOME=/home/user
-          export PS1='\u@\h:\w\$ '
-          PROFILEEOF
-
-          # ---- opkg 配置：装到 /data/opt，lists/lock 也走 /data ----
-          sudo mkdir -p /mnt/sys/etc/opkg
-          sudo tee /mnt/sys/etc/opkg.conf > /dev/null <<'OPKGEOF'
-          dest root /data/opt
-          dest ram /tmp
-          lists_dir ext /data/var/opkg-lists
-
-          src/gz openwrt_base http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/base
-          src/gz openwrt_packages http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/packages
-          src/gz openwrt_targets http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/packages
-          OPKGEOF
-
-          # ---- /sbin/init ----
-          sudo rm -f /mnt/sys/sbin/init
-          sudo tee /mnt/sys/sbin/init > /dev/null <<'INITEOF'
-          #!/bin/sh
-
-          mount -t proc none /proc
-          mount -t sysfs none /sys
-
-          hostname tinylinux
-
-          # 挂 userdata
-          mkdir -p /data
-          mount /dev/vdb /data
-
-          # userdata 里的必备目录（首次启动可能空）
-          mkdir -p /data/var/lock /data/var/opkg-lists \
-                   /data/opt /data/home/user /data/tmp
-          chown 1000:1000 /data/opt /data/home/user 2>/dev/null
-          chmod 777 /data/var/lock /data/var/opkg-lists
-
-          # 把可变目录挂/链到系统里
-          rm -rf /var/lock /var/opkg-lists
-          ln -sf /data/var/lock /var/lock
-          ln -sf /data/var/opkg-lists /var/opkg-lists
-
-          mount --bind /data/home /home
-          mount --bind /data/opt /opt
-          mount -t tmpfs tmpfs /tmp
-
-          # 联网
-          ip link set eth0 up 2>/dev/null
-          udhcpc -i eth0 -q -n -t 3 2>/dev/null
-
-          echo
-          echo "Welcome to Tiny Linux"
-          echo
-
-          exec </dev/ttyS0 >/dev/ttyS0 2>&1
-          exec /bin/busybox setsid /bin/busybox cttyhack /bin/login
-          INITEOF
-          sudo chmod +x /mnt/sys/sbin/init
-
-          # ---- 权限收尾 ----
-          sudo chown -R 0:0 /mnt/sys
-          sudo chown -R 1000:1000 /mnt/sys/home/user
-          sudo chmod u+s /mnt/sys/bin/busybox
-
-          sudo umount /mnt/sys
-
-      # ==================== userdata.img（可写用户数据）====================
+      # ==================== userdata.img ====================
       - name: Build userdata image
         run: |
           set -e
@@ -206,20 +369,22 @@ jobs:
           sudo mkdir -p /mnt/data
           sudo mount -o loop userdata.img /mnt/data
 
-          sudo mkdir -p /mnt/data/opt \
-                        /mnt/data/home/user \
-                        /mnt/data/var/lock \
-                        /mnt/data/var/opkg-lists \
+          sudo mkdir -p /mnt/data/opt /mnt/data/home/user \
+                        /mnt/data/var/lock /mnt/data/var/run \
+                        /mnt/data/var/log /mnt/data/var/opkg-lists \
                         /mnt/data/tmp
 
-          # /opt 和 /home/user 归 user
           sudo chown -R 1000:1000 /mnt/data/opt /mnt/data/home/user
-          # opkg 的锁目录和索引目录也归 user，这样 user 能 opkg update
-          sudo chown -R 1000:1000 /mnt/data/var/lock /mnt/data/var/opkg-lists
+          sudo chown -R 1000:1000 /mnt/data/var/opkg-lists
+          sudo chmod 777 /mnt/data/var/lock /mnt/data/var/run /mnt/data/var/log
+          sudo chmod 1777 /mnt/data/tmp
+
+          sudo touch /mnt/data/var/resolv.conf
+          sudo chmod 666 /mnt/data/var/resolv.conf
 
           sudo umount /mnt/data
 
-      # ==================== 收集产物 ====================
+      # ==================== 产物 ====================
       - name: Collect artifacts
         run: |
           mkdir -p out
@@ -230,5 +395,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tiny-linux-qemu-opkg
+          name: tiny-linux-secure
           path: out/

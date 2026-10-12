@@ -43,6 +43,10 @@ jobs:
             http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/openwrt-23.05.2-x86-64-rootfs.tar.gz
           mkdir -p owrt
           tar -xzf owrt.tar.gz -C owrt
+          echo ">>> Looking for opkg in OpenWrt rootfs:"
+          find /tmp/owrt -type f -name opkg 2>/dev/null
+          echo ">>> /tmp/owrt/lib contents:"
+          ls -l /tmp/owrt/lib/ | head -30
 
       # ==================== system.img ====================
       - name: Build system image
@@ -61,21 +65,35 @@ jobs:
                   /mnt/sys/usr/share/udhcpc/default.script
           sudo chmod +x /mnt/sys/usr/share/udhcpc/default.script
 
-          # musl 库
+          # ---- musl 库 ----
           sudo cp -a /tmp/owrt/lib/*.so* /mnt/sys/lib/ 2>/dev/null || true
           sudo cp -a /tmp/owrt/usr/lib/*.so* /mnt/sys/usr/lib/ 2>/dev/null || true
           sudo rm -f /mnt/sys/lib/ld-musl-x86_64.so.1
           sudo ln -sf /lib/libc.so /mnt/sys/lib/ld-musl-x86_64.so.1
 
-          # opkg
-          sudo cp /tmp/owrt/usr/bin/opkg /mnt/sys/usr/bin/opkg
+          # ---- opkg（find 定位，兼容不同版本路径）----
+          OPKG_BIN=$(find /tmp/owrt -type f -name opkg 2>/dev/null | head -1)
+          if [ -z "$OPKG_BIN" ]; then
+              echo "ERROR: opkg binary not found in OpenWrt rootfs"
+              echo "Searching for opkg-like files:"
+              find /tmp/owrt -name 'opkg*' 2>/dev/null
+              find /tmp/owrt -type f -perm -u+x 2>/dev/null | grep -E '/(opkg|apk)$' || true
+              exit 1
+          fi
+          echo ">>> Found opkg at: $OPKG_BIN"
+          sudo cp "$OPKG_BIN" /mnt/sys/usr/bin/opkg
           sudo chmod +x /mnt/sys/usr/bin/opkg
 
-          # 删 su
+          # 检查是否有 apk（新版 OpenWrt 换了包管理器）
+          if [ -f /tmp/owrt/sbin/apk ] || [ -f /tmp/owrt/usr/bin/apk ]; then
+              echo "NOTE: this OpenWrt rootfs also contains apk"
+          fi
+
+          # ---- 删 su ----
           sudo find /mnt/sys -name su -type l -delete
           sudo rm -f /mnt/sys/bin/su /mnt/sys/sbin/su /mnt/sys/usr/bin/su
 
-          # 账户：root 不能登录
+          # ---- 账户：root 不能登录 ----
           sudo tee /mnt/sys/etc/passwd > /dev/null <<'EOF'
           root:x:0:0:root:/root:/sbin/nologin
           user:x:1000:1000:user:/home/user:/bin/sh
@@ -101,7 +119,7 @@ jobs:
           export PS1='\u@\h:\w\$ '
           PROFILEEOF
 
-          # opkg 装到 /data/opt
+          # ---- opkg 装到 /data/opt ----
           sudo mkdir -p /mnt/sys/etc/opkg
           sudo tee /mnt/sys/etc/opkg.conf > /dev/null <<'OPKGEOF'
           dest root /data/opt
@@ -113,7 +131,7 @@ jobs:
           src/gz openwrt_targets http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/packages
           OPKGEOF
 
-          # /var 下可变目录软链到 /data
+          # ---- /var 可变目录软链到 /data ----
           sudo rm -rf /mnt/sys/var/lock /mnt/sys/var/run /mnt/sys/var/log /mnt/sys/var/opkg-lists
           sudo ln -sf /data/var/lock       /mnt/sys/var/lock
           sudo ln -sf /data/var/run        /mnt/sys/var/run
@@ -123,7 +141,7 @@ jobs:
           sudo rm -f /mnt/sys/etc/resolv.conf
           sudo ln -sf /data/var/resolv.conf /mnt/sys/etc/resolv.conf
 
-          # /sbin/init（校验通过后才跑）
+          # ---- /sbin/init ----
           sudo rm -f /mnt/sys/sbin/init
           sudo tee /mnt/sys/sbin/init > /dev/null <<'INITEOF'
           #!/bin/sh
@@ -204,7 +222,7 @@ jobs:
 
           sudo umount /mnt/sys
 
-      # ==================== initramfs（内嵌校验逻辑）====================
+      # ==================== initramfs（内嵌校验）====================
       - name: Build initramfs with verifier
         run: |
           set -e
@@ -216,7 +234,7 @@ jobs:
 
           cd initramfs/bin
           for c in sh mount umount sha256sum readlink grep cut sort diff find \
-                   cat echo sleep poweroff switch_root mkdir head cmp; do
+                   cat echo sleep poweroff switch_root mkdir head cmp sed; do
             ln -sf busybox $c
           done
           cd ../..
@@ -241,7 +259,6 @@ jobs:
 
           FAIL=0
 
-          # 1) 逐文件 sha256 + 逐软链目标
           while IFS=' ' read -r type val path; do
               [ -z "$type" ] && continue
               case "$type" in
@@ -262,7 +279,6 @@ jobs:
               esac
           done < /system.manifest
 
-          # 2) 检测增删文件
           cd /sysroot
           /bin/busybox find . -type f \
               -not -path './proc/*' -not -path './sys/*' -not -path './dev/*' \
@@ -294,7 +310,6 @@ jobs:
               echo
               /bin/busybox sleep 5
               /bin/busybox poweroff -f
-              # 死循环兜底，即使 poweroff 没生效也不会给 shell
               while true; do /bin/busybox sleep 3600; done
           fi
 
@@ -312,9 +327,8 @@ jobs:
           INITEOF
           chmod +x initramfs/init
 
-          echo ">>> initramfs contents:"
+          echo ">>> initramfs built:"
           ls -la initramfs/
-          echo ">>> init is executable:"
           ls -l initramfs/init
 
       # ==================== 内核（嵌 initramfs）====================
@@ -340,16 +354,13 @@ jobs:
           scripts/config --enable DEVTMPFS
           scripts/config --enable DEVTMPFS_MOUNT
 
-          # 嵌入 initramfs
           scripts/config --enable BLK_DEV_INITRD
           scripts/config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/initramfs"
 
-          # 内嵌 cmdline，并覆盖外部参数（防 init=xxx 绕过）
           scripts/config --enable CMDLINE_BOOL
           scripts/config --set-str CMDLINE "rdinit=/init console=ttyS0 loglevel=7 panic=10"
           scripts/config --enable CMDLINE_OVERRIDE
 
-          # 防止 initramfs 校验失败后 panic 重启绕过
           scripts/config --enable PANIC_ON_OOPS
           scripts/config --disable BOOTPARAM_SOFTLOCKUP_PANIC
 

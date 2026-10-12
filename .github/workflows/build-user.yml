@@ -220,6 +220,7 @@ jobs:
           echo "Manifest lines: $(wc -l < /tmp/system.manifest)"
           head -5 /tmp/system.manifest
 
+          cd /
           sudo umount /mnt/sys
 
       # ==================== initramfs（内嵌校验）====================

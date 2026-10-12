@@ -110,7 +110,7 @@ jobs:
           EOF
           sudo chmod 600 /mnt/sys/etc/shadow
 
-          : > /mnt/sys/etc/securetty
+          sudo tee /mnt/sys/etc/securetty > /dev/null < /dev/null
 
           sudo tee /mnt/sys/etc/profile > /dev/null <<'PROFILEEOF'
           export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin

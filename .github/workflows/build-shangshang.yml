@@ -1,4 +1,4 @@
-name: Tiny Linux (TPM + LUKS + duress)
+name: Tiny Linux (TPM + LUKS + duress + SecureBoot + games)
 
 on:
   workflow_dispatch:
@@ -15,14 +15,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison bc \
-          libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
-          e2fsprogs cryptsetup-bin sbsigntool efitools mtools ovmf \
-          uuid-runtime swtpm tpm2-tools binutils python3-pip
-          # virt-firmware 不在 apt 源里，用 pip 装
+            libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
+            e2fsprogs cryptsetup-bin sbsigntool efitools mtools ovmf \
+            uuid-runtime swtpm tpm2-tools binutils python3-pip
+          pip3 install --user --upgrade pip setuptools wheel
           pip3 install --user virt-firmware
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          # 验证
-          which virt-fw-vars || ls -l $HOME/.local/bin/
+          $HOME/.local/bin/virt-fw-vars --help | head -3 || true
 
       - name: Generate Secure Boot keys
         run: |
@@ -80,7 +79,7 @@ jobs:
                   fi
               done
           done
-          ls *.ipk | wc -l
+          echo ">>> Downloaded $(ls *.ipk 2>/dev/null | wc -l) packages"
 
           for ipk in *.ipk; do
               [ -f "$ipk" ] || continue
@@ -90,8 +89,10 @@ jobs:
               [ -f data.tar.xz ] && tar -xJf data.tar.xz -C /tmp/pkgroot 2>/dev/null || true
               cd "$OLDPWD"; rm -rf "$d"
           done
-          ls /tmp/pkgroot/usr/bin/ 2>/dev/null | grep tpm2 || echo "no tpm2"
-          ls /tmp/pkgroot/usr/sbin/ 2>/dev/null | grep cryptsetup || echo "no cryptsetup"
+          echo ">>> tpm2 tools:"
+          ls /tmp/pkgroot/usr/bin/ 2>/dev/null | grep tpm2 || echo "none"
+          echo ">>> cryptsetup:"
+          ls /tmp/pkgroot/usr/sbin/ 2>/dev/null | grep cryptsetup || echo "none"
 
       - name: Build system image
         run: |
@@ -419,9 +420,9 @@ jobs:
           set -e
           dd if=/dev/urandom of=luks.key bs=32 count=1
           dd if=/dev/zero of=userdata.img bs=1M count=1024
-          cryptsetup luksFormat --type luks2 --key-file=luks.key --batch-mode userdata.img
-          cryptsetup luksOpen --key-file=luks.key userdata.img data_crypt
-          mkfs.ext4 -F /dev/mapper/data_crypt
+          sudo cryptsetup luksFormat --type luks2 --key-file=luks.key --batch-mode userdata.img
+          sudo cryptsetup luksOpen --key-file=luks.key userdata.img data_crypt
+          sudo mkfs.ext4 -F /dev/mapper/data_crypt
           sudo mkdir -p /mnt/data
           sudo mount /dev/mapper/data_crypt /mnt/data
 
@@ -574,9 +575,9 @@ jobs:
           sudo chown -R 0:0 /mnt/data/.templates
 
           sudo umount /mnt/data
-          cryptsetup luksClose data_crypt
+          sudo cryptsetup luksClose data_crypt
 
-      - name: Setup swtpm
+      - name: Setup swtpm and seal LUKS key
         run: |
           set -e
           rm -rf swtpm-state && mkdir -p swtpm-state
@@ -661,7 +662,7 @@ jobs:
           INITEOF
           chmod +x initramfs/init
           echo ">>> initramfs:"
-          ls -la initramfs/ && cat initramfs/init | head -3
+          ls -la initramfs/
 
       - name: Download kernel
         run: |
@@ -734,7 +735,7 @@ jobs:
             cp /usr/share/OVMF/OVMF_CODE.fd secureboot/OVMF_CODE.fd
           cp /usr/share/OVMF/OVMF_VARS_4M.fd secureboot/OVMF_VARS.fd 2>/dev/null || \
             cp /usr/share/OVMF/OVMF_VARS.fd secureboot/OVMF_VARS.fd
-          virt-fw-vars --input secureboot/OVMF_VARS.fd \
+          $HOME/.local/bin/virt-fw-vars --input secureboot/OVMF_VARS.fd \
                        --output secureboot/OVMF_VARS-signed.fd \
                        --secure-boot \
                        --set-pk $(uuidgen) secureboot/PK.crt \

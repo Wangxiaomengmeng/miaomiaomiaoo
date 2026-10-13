@@ -15,9 +15,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison bc \
-            libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
-            e2fsprogs cryptsetup-bin sbsigntool efitools mtools ovmf \
-            uuid-runtime virt-firmware swtpm tpm2-tools binutils
+          libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
+          e2fsprogs cryptsetup-bin sbsigntool efitools mtools ovmf \
+          uuid-runtime swtpm tpm2-tools binutils python3-pip
+          # virt-firmware 不在 apt 源里，用 pip 装
+          pip3 install --user virt-firmware
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          # 验证
+          which virt-fw-vars || ls -l $HOME/.local/bin/
 
       - name: Generate Secure Boot keys
         run: |

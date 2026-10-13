@@ -1,4 +1,4 @@
-name: Tiny Linux (TPM + LUKS + duress + SecureBoot + games)
+name: Tiny Linux (TPM + LUKS + duress)
 
 on:
   workflow_dispatch:
@@ -17,15 +17,15 @@ jobs:
           sudo apt-get install -y build-essential flex bison bc \
             libssl-dev libelf-dev libncurses-dev cpio wget xz-utils \
             e2fsprogs cryptsetup-bin sbsigntool efitools mtools ovmf \
-            uuid-runtime virt-firmware swtpm tpm2-tools arj binutils
+            uuid-runtime virt-firmware swtpm tpm2-tools binutils
 
       - name: Generate Secure Boot keys
         run: |
           set -e
           mkdir -p secureboot && cd secureboot
-          openssl req -new -x509 -newkey rsa:2048 -keyout PK.key   -out PK.crt   -days 3650 -nodes -subj "/CN=MyPK/"
-          openssl req -new -x509 -newkey rsa:2048 -keyout KEK.key  -out KEK.crt  -days 3650 -nodes -subj "/CN=MyKEK/"
-          openssl req -new -x509 -newkey rsa:2048 -keyout db.key   -out db.crt   -days 3650 -nodes -subj "/CN=MyDB/"
+          openssl req -new -x509 -newkey rsa:2048 -keyout PK.key  -out PK.crt  -days 3650 -nodes -subj "/CN=MyPK/"
+          openssl req -new -x509 -newkey rsa:2048 -keyout KEK.key -out KEK.crt -days 3650 -nodes -subj "/CN=MyKEK/"
+          openssl req -new -x509 -newkey rsa:2048 -keyout db.key  -out db.crt  -days 3650 -nodes -subj "/CN=MyDB/"
           cert-to-efi-sig-list -g $(uuidgen) PK.crt  PK.esl
           cert-to-efi-sig-list -g $(uuidgen) KEK.crt KEK.esl
           cert-to-efi-sig-list -g $(uuidgen) db.crt  db.esl
@@ -33,7 +33,7 @@ jobs:
           sign-efi-sig-list -k PK.key  -c PK.crt  KEK KEK.esl KEK.auth
           sign-efi-sig-list -k KEK.key -c KEK.crt db  db.esl  db.auth
 
-      - name: Download and build busybox
+      - name: Build busybox
         run: |
           wget -q https://busybox.net/downloads/busybox-1.36.1.tar.bz2
           tar -xf busybox-1.36.1.tar.bz2
@@ -44,17 +44,18 @@ jobs:
           sed -i 's/^CONFIG_SU=y/# CONFIG_SU is not set/' .config
           sed -i 's/^CONFIG_FEATURE_SU=y/# CONFIG_FEATURE_SU is not set/' .config
           make oldconfig
-          make -j$(nproc)
-          make install
+          make -j$(nproc) && make install
 
-      - name: Download OpenWrt rootfs and TPM/cryptsetup ipks
+      - name: Download OpenWrt rootfs
         run: |
-          set -e
           cd /tmp
           wget -q -O owrt.tar.gz \
             http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/openwrt-23.05.2-x86-64-rootfs.tar.gz
           mkdir -p owrt && tar -xzf owrt.tar.gz -C owrt
 
+      - name: Download TPM and cryptsetup ipks
+        run: |
+          set -e
           mkdir -p /tmp/pkgs /tmp/pkgroot && cd /tmp/pkgs
           BASE=http://downloads.openwrt.org/releases/23.05.2/packages/x86_64
           wget -q -O base.list     "$BASE/base/Packages"
@@ -80,12 +81,12 @@ jobs:
               [ -f "$ipk" ] || continue
               d=$(mktemp -d); cd "$d"
               ar x "$OLDPWD/$ipk" 2>/dev/null || { cd "$OLDPWD"; rm -rf "$d"; continue; }
-              [ -f data.tar.gz ] && tar -xzf data.tar.gz -C /tmp/pkgroot 2>/dev/null
-              [ -f data.tar.xz ] && tar -xJf data.tar.xz -C /tmp/pkgroot 2>/dev/null
+              [ -f data.tar.gz ] && tar -xzf data.tar.gz -C /tmp/pkgroot 2>/dev/null || true
+              [ -f data.tar.xz ] && tar -xJf data.tar.xz -C /tmp/pkgroot 2>/dev/null || true
               cd "$OLDPWD"; rm -rf "$d"
           done
-          ls /tmp/pkgroot/usr/bin/ | grep tpm2 || echo "no tpm2"
-          ls /tmp/pkgroot/usr/sbin/ | grep cryptsetup || echo "no cryptsetup"
+          ls /tmp/pkgroot/usr/bin/ 2>/dev/null | grep tpm2 || echo "no tpm2"
+          ls /tmp/pkgroot/usr/sbin/ 2>/dev/null | grep cryptsetup || echo "no cryptsetup"
 
       - name: Build system image
         run: |
@@ -118,37 +119,39 @@ jobs:
           sudo rm -f /mnt/sys/bin/su /mnt/sys/sbin/su /mnt/sys/usr/bin/su
 
           sudo tee /mnt/sys/etc/passwd > /dev/null <<'EOF'
-root:x:0:0:root:/root:/sbin/nologin
-user:x:1000:1000:user:/home/user:/bin/sh
-EOF
+          root:x:0:0:root:/root:/sbin/nologin
+          user:x:1000:1000:user:/home/user:/bin/sh
+          EOF
+
           sudo tee /mnt/sys/etc/group > /dev/null <<'EOF'
-root:x:0:
-user:x:1000:
-EOF
+          root:x:0:
+          user:x:1000:
+          EOF
+
           sudo tee /mnt/sys/etc/shadow > /dev/null <<'EOF'
-root:*:0:0:99999:7:::
-user:*:1000:0:99999:7:::
-EOF
+          root:*:0:0:99999:7:::
+          user:*:1000:0:99999:7:::
+          EOF
           sudo chmod 600 /mnt/sys/etc/shadow
           sudo tee /mnt/sys/etc/securetty > /dev/null < /dev/null
 
           sudo tee /mnt/sys/etc/profile > /dev/null <<'PROFILEEOF'
-export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin
-export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
-export HOME=/home/user
-export PS1='user@tinylinux:\w\$ '
-PROFILEEOF
+          export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin
+          export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
+          export HOME=/home/user
+          export PS1='user@tinylinux:\w\$ '
+          PROFILEEOF
 
           sudo mkdir -p /mnt/sys/etc/opkg
           sudo tee /mnt/sys/etc/opkg.conf > /dev/null <<'OPKGEOF'
-dest root /data/opt
-dest ram /tmp
-lists_dir ext /data/var/opkg-lists
+          dest root /data/opt
+          dest ram /tmp
+          lists_dir ext /data/var/opkg-lists
 
-src/gz openwrt_base http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/base
-src/gz openwrt_packages http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/packages
-src/gz openwrt_targets http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/packages
-OPKGEOF
+          src/gz openwrt_base http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/base
+          src/gz openwrt_packages http://downloads.openwrt.org/releases/23.05.2/packages/x86_64/packages
+          src/gz openwrt_targets http://downloads.openwrt.org/releases/23.05.2/targets/x86/64/packages
+          OPKGEOF
           sudo rm -rf /mnt/sys/usr/lib/opkg
           sudo ln -sf /data/var/opkg-db /mnt/sys/usr/lib/opkg
 
@@ -160,254 +163,244 @@ OPKGEOF
           sudo rm -f /mnt/sys/etc/resolv.conf
           sudo ln -sf /data/var/resolv.conf /mnt/sys/etc/resolv.conf
 
-          # ==================== /sbin/init ====================
           sudo rm -f /mnt/sys/sbin/init
           sudo tee /mnt/sys/sbin/init > /dev/null <<'INITEOF'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs devtmpfs /dev
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs devtmpfs /dev
 
-hostname tinylinux
+          hostname tinylinux
 
-echo 1 > /proc/sys/kernel/kptr_restrict 2>/dev/null
-echo 1 > /proc/sys/kernel/dmesg_restrict 2>/dev/null
-echo 1 > /proc/sys/kernel/modules_disabled 2>/dev/null
-echo 1 > /proc/sys/kernel/kexec_load_disabled 2>/dev/null
-echo 3 > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null
-echo 2 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null
-echo "0 65535" > /proc/sys/net/ipv4/ping_group_range
+          echo 1 > /proc/sys/kernel/kptr_restrict 2>/dev/null
+          echo 1 > /proc/sys/kernel/dmesg_restrict 2>/dev/null
+          echo 1 > /proc/sys/kernel/modules_disabled 2>/dev/null
+          echo 1 > /proc/sys/kernel/kexec_load_disabled 2>/dev/null
+          echo 3 > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null
+          echo 2 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null
+          echo "0 65535" > /proc/sys/net/ipv4/ping_group_range
 
-ip link set eth0 up 2>/dev/null
-udhcpc -i eth0 -q -n -t 3 2>/dev/null
+          ip link set eth0 up 2>/dev/null
+          udhcpc -i eth0 -q -n -t 3 2>/dev/null
 
-chmod 666 /dev/ttyS0 /dev/console /dev/tty 2>/dev/null
-exec </dev/ttyS0 >/dev/ttyS0 2>&1
+          chmod 666 /dev/ttyS0 /dev/console /dev/tty 2>/dev/null
+          exec </dev/ttyS0 >/dev/ttyS0 2>&1
 
-mkdir -p /dev/mapper
-[ -e /dev/mapper/control ] || mknod /dev/mapper/control c 10 236
+          mkdir -p /dev/mapper
+          [ -e /dev/mapper/control ] || mknod /dev/mapper/control c 10 236
 
-echo
-echo "=== Tiny Linux init ==="
+          echo
+          echo "=== Tiny Linux init ==="
 
-i=0
-while [ $i -lt 10 ] && [ ! -e /dev/tpm0 ]; do
-    sleep 1; i=$((i+1))
-done
-if [ ! -e /dev/tpm0 ]; then
-    echo "FATAL: no TPM"
-    sleep 5; poweroff -f; while true; do sleep 3600; done
-fi
+          i=0
+          while [ $i -lt 10 ] && [ ! -e /dev/tpm0 ]; do
+              sleep 1; i=$((i+1))
+          done
+          if [ ! -e /dev/tpm0 ]; then
+              echo "FATAL: no TPM"
+              sleep 5; poweroff -f; while true; do sleep 3600; done
+          fi
 
-echo "TPM unsealing..."
-/usr/bin/tpm2_unseal -c /etc/tpm/primary.ctx \
-    -u /etc/tpm/sealed.pub -r /etc/tpm/sealed.priv \
-    -o /tmp/luks.key 2>/tmp/tpmerr
-if [ ! -s /tmp/luks.key ]; then
-    echo "FATAL: TPM unseal failed"
-    cat /tmp/tpmerr 2>/dev/null
-    sleep 10; poweroff -f; while true; do sleep 3600; done
-fi
+          echo "TPM unsealing..."
+          /usr/bin/tpm2_unseal -c /etc/tpm/primary.ctx \
+              -u /etc/tpm/sealed.pub -r /etc/tpm/sealed.priv \
+              -o /tmp/luks.key 2>/tmp/tpmerr
+          if [ ! -s /tmp/luks.key ]; then
+              echo "FATAL: TPM unseal failed"
+              cat /tmp/tpmerr 2>/dev/null
+              sleep 10; poweroff -f; while true; do sleep 3600; done
+          fi
 
-echo "Opening data layer..."
-/usr/sbin/cryptsetup luksOpen --key-file /tmp/luks.key /dev/vdd data_crypt
-rm -f /tmp/luks.key
-if [ ! -b /dev/mapper/data_crypt ]; then
-    echo "FATAL: data layer open failed"
-    sleep 5; poweroff -f; while true; do sleep 3600; done
-fi
-mkdir -p /data
-mount /dev/mapper/data_crypt /data
+          echo "Opening data layer..."
+          /usr/sbin/cryptsetup luksOpen --key-file /tmp/luks.key /dev/vdd data_crypt
+          rm -f /tmp/luks.key
+          if [ ! -b /dev/mapper/data_crypt ]; then
+              echo "FATAL: data layer open failed"
+              sleep 5; poweroff -f; while true; do sleep 3600; done
+          fi
+          mkdir -p /data
+          mount /dev/mapper/data_crypt /data
 
-hash_password() {
-    printf '%s' "tlsalt$1" | sha256sum | cut -d' ' -f1
-}
+          hash_password() {
+              printf '%s' "tlsalt$1" | sha256sum | cut -d' ' -f1
+          }
 
-wipe_data() {
-    echo
-    echo "==================================="
-    echo "  Wiping all user data..."
-    echo "==================================="
-    sync
-    umount /home 2>/dev/null
-    umount /data 2>/dev/null
-    /usr/sbin/cryptsetup luksClose data_crypt 2>/dev/null
-    dd if=/dev/urandom of=/dev/vdd bs=1M count=32 2>/dev/null
-    sync
-    echo "Done. Rebooting in 3 seconds..."
-    sleep 3
-    reboot -f
-    while true; do sleep 3600; done
-}
+          wipe_data() {
+              echo
+              echo "==================================="
+              echo "  Wiping all user data..."
+              echo "==================================="
+              sync
+              umount /home 2>/dev/null
+              umount /data 2>/dev/null
+              /usr/sbin/cryptsetup luksClose data_crypt 2>/dev/null
+              dd if=/dev/urandom of=/dev/vdd bs=1M count=32 2>/dev/null
+              sync
+              echo "Done. Rebooting in 3 seconds..."
+              sleep 3
+              reboot -f
+              while true; do sleep 3600; done
+          }
 
-# ==================== 首次启动 ====================
-if [ ! -f /data/.initialized ]; then
-    echo
-    echo "=============================================="
-    echo "  First boot: mandatory password setup"
-    echo "=============================================="
-    echo
+          if [ ! -f /data/.initialized ]; then
+              echo
+              echo "=============================================="
+              echo "  First boot: mandatory password setup"
+              echo "=============================================="
+              echo
 
-    # 用户密码
-    while :; do
-        printf "Set USER password (>=8 chars, letters+digits): "
-        read pw1
-        len=${#pw1}
-        if [ "$len" -lt 8 ]; then
-            echo "  [x] too short (need >=8)"; continue
-        fi
-        has_digit=0; has_letter=0; has_special=0
-        case "$pw1" in *[0-9]*) has_digit=1 ;; esac
-        case "$pw1" in *[a-zA-Z]*) has_letter=1 ;; esac
-        case "$pw1" in *[^a-zA-Z0-9]*) has_special=1 ;; esac
-        if [ "$has_digit" != "1" ] || [ "$has_letter" != "1" ]; then
-            echo "  [x] need both letters and digits"; continue
-        fi
-        printf "Confirm USER password: "
-        read pw2
-        [ "$pw1" = "$pw2" ] || { echo "  [x] mismatch"; continue; }
-        break
-    done
-    USER_PW="$pw1"
+              while :; do
+                  printf "Set USER password (>=8 chars, letters+digits): "
+                  read pw1
+                  len=${#pw1}
+                  if [ "$len" -lt 8 ]; then
+                      echo "  [x] too short"; continue
+                  fi
+                  has_digit=0; has_letter=0
+                  case "$pw1" in *[0-9]*) has_digit=1 ;; esac
+                  case "$pw1" in *[a-zA-Z]*) has_letter=1 ;; esac
+                  if [ "$has_digit" != "1" ] || [ "$has_letter" != "1" ]; then
+                      echo "  [x] need letters and digits"; continue
+                  fi
+                  printf "Confirm USER password: "
+                  read pw2
+                  [ "$pw1" = "$pw2" ] || { echo "  [x] mismatch"; continue; }
+                  break
+              done
+              USER_PW="$pw1"
 
-    # 胁迫密码
-    while :; do
-        echo
-        printf "Set DURESS password (must differ from user pw, >=8 chars): "
-        read dp1
-        len=${#dp1}
-        if [ "$len" -lt 8 ]; then
-            echo "  [x] too short"; continue
-        fi
-        if [ "$dp1" = "$USER_PW" ]; then
-            echo "  [x] must differ from user password"; continue
-        fi
-        printf "Confirm DURESS password: "
-        read dp2
-        [ "$dp1" = "$dp2" ] || { echo "  [x] mismatch"; continue; }
-        break
-    done
-    DURESS_PW="$dp1"
+              while :; do
+                  echo
+                  printf "Set DURESS password (must differ, >=8 chars): "
+                  read dp1
+                  len=${#dp1}
+                  if [ "$len" -lt 8 ]; then
+                      echo "  [x] too short"; continue
+                  fi
+                  if [ "$dp1" = "$USER_PW" ]; then
+                      echo "  [x] must differ"; continue
+                  fi
+                  printf "Confirm DURESS password: "
+                  read dp2
+                  [ "$dp1" = "$dp2" ] || { echo "  [x] mismatch"; continue; }
+                  break
+              done
+              DURESS_PW="$dp1"
 
-    # 创建第二层加密 home.img
-    echo
-    echo "Creating encrypted home container (second layer)..."
-    dd if=/dev/zero of=/data/home.img bs=1M count=512
+              echo
+              echo "Creating encrypted home container..."
+              dd if=/dev/zero of=/data/home.img bs=1M count=512
 
-    printf '%s' "$USER_PW" | /usr/sbin/cryptsetup luksFormat --type luks2 \
-        --batch-mode --key-file - /data/home.img
+              printf '%s' "$USER_PW" | /usr/sbin/cryptsetup luksFormat --type luks2 \
+                  --batch-mode --key-file - /data/home.img
 
-    printf '%s' "$USER_PW" | /usr/sbin/cryptsetup luksOpen \
-        --key-file - /data/home.img home_crypt
+              printf '%s' "$USER_PW" | /usr/sbin/cryptsetup luksOpen \
+                  --key-file - /data/home.img home_crypt
 
-    mkfs.ext4 -F /dev/mapper/home_crypt
+              mkfs.ext4 -F /dev/mapper/home_crypt
 
-    mkdir -p /home
-    mount /dev/mapper/home_crypt /home
+              mkdir -p /home
+              mount /dev/mapper/home_crypt /home
 
-    mkdir -p /home/user/games
-    if [ -d /data/.templates/games ]; then
-        cp -a /data/.templates/games/. /home/user/games/
-    fi
-    chown -R 1000:1000 /home/user
+              mkdir -p /home/user
+              if [ -d /data/.templates/games ]; then
+                  cp -a /data/.templates/games /home/user/
+              fi
+              chown -R 1000:1000 /home/user
 
-    sync
-    umount /home
-    /usr/sbin/cryptsetup luksClose home_crypt
+              sync
+              umount /home
+              /usr/sbin/cryptsetup luksClose home_crypt
 
-    # 存胁迫密码哈希
-    hash_password "$DURESS_PW" > /data/.duresshash
-    chmod 600 /data/.duresshash
-    touch /data/.initialized
-    chmod 600 /data/.initialized
+              hash_password "$DURESS_PW" > /data/.duresshash
+              chmod 600 /data/.duresshash
+              touch /data/.initialized
+              chmod 600 /data/.initialized
 
-    mkdir -p /data/opt /data/var/lock /data/var/run /data/var/log \
-             /data/var/opkg-lists /data/var/opkg-db /data/var/opkg-db/info /data/tmp
-    chown 1000:1000 /data/opt
-    chown 1000:1000 /data/var/opkg-lists /data/var/opkg-db
-    chmod 777 /data/var/lock /data/var/run /data/var/log
-    chmod 1777 /data/tmp
-    touch /data/var/resolv.conf
-    chmod 666 /data/var/resolv.conf
+              mkdir -p /data/opt /data/var/lock /data/var/run /data/var/log \
+                       /data/var/opkg-lists /data/var/opkg-db /data/var/opkg-db/info /data/tmp
+              chown 1000:1000 /data/opt
+              chown 1000:1000 /data/var/opkg-lists /data/var/opkg-db
+              chmod 777 /data/var/lock /data/var/run /data/var/log
+              chmod 1777 /data/tmp
+              touch /data/var/resolv.conf
+              chmod 666 /data/var/resolv.conf
 
-    echo
-    echo "Setup complete. Rebooting..."
-    sleep 3
-    reboot -f
-    while true; do sleep 3600; done
-fi
+              echo
+              echo "Setup complete. Rebooting..."
+              sleep 3
+              reboot -f
+              while true; do sleep 3600; done
+          fi
 
-# ==================== 正常登录 ====================
-echo
-echo "Authentication required."
+          echo
+          echo "Authentication required."
 
-tries=0
-while [ $tries -lt 5 ]; do
-    printf "Password: "
-    stty -echo 2>/dev/null
-    read pw
-    stty echo 2>/dev/null
-    echo
+          tries=0
+          while [ $tries -lt 5 ]; do
+              printf "Password: "
+              stty -echo 2>/dev/null
+              read pw
+              stty echo 2>/dev/null
+              echo
 
-    [ -z "$pw" ] && continue
+              [ -z "$pw" ] && continue
 
-    # 胁迫检查（先）
-    h=$(hash_password "$pw")
-    duressh=$(cat /data/.duresshash 2>/dev/null)
-    if [ -n "$duressh" ] && [ "$h" = "$duressh" ]; then
-        wipe_data
-    fi
+              h=$(hash_password "$pw")
+              duressh=$(cat /data/.duresshash 2>/dev/null)
+              if [ -n "$duressh" ] && [ "$h" = "$duressh" ]; then
+                  wipe_data
+              fi
 
-    # 尝试打开 home
-    if printf '%s' "$pw" | /usr/sbin/cryptsetup luksOpen \
-        --test-passphrase --key-file - /data/home.img 2>/dev/null; then
-        printf '%s' "$pw" | /usr/sbin/cryptsetup luksOpen \
-            --key-file - /data/home.img home_crypt
-        mkdir -p /home
-        mount /dev/mapper/home_crypt /home
-        break
-    fi
+              if printf '%s' "$pw" | /usr/sbin/cryptsetup luksOpen \
+                  --test-passphrase --key-file - /data/home.img 2>/dev/null; then
+                  printf '%s' "$pw" | /usr/sbin/cryptsetup luksOpen \
+                      --key-file - /data/home.img home_crypt
+                  mkdir -p /home
+                  mount /dev/mapper/home_crypt /home
+                  break
+              fi
 
-    tries=$((tries+1))
-    echo "  wrong password ($tries/5)"
-done
+              tries=$((tries+1))
+              echo "  wrong password ($tries/5)"
+          done
 
-if [ $tries -ge 5 ]; then
-    echo "Too many failed attempts. Shutting down."
-    sleep 5
-    poweroff -f
-    while true; do sleep 3600; done
-fi
+          if [ $tries -ge 5 ]; then
+              echo "Too many failed attempts."
+              sleep 5
+              poweroff -f
+              while true; do sleep 3600; done
+          fi
 
-mkdir -p /data/var/lock /data/var/run /data/var/log /data/var/opkg-lists \
-         /data/var/opkg-db /data/var/opkg-db/info /data/opt /data/tmp
-chown 1000:1000 /data/opt
-chown 1000:1000 /data/var/opkg-lists /data/var/opkg-db
-chmod 777 /data/var/lock /data/var/run /data/var/log
-touch /data/var/resolv.conf
-chmod 666 /data/var/resolv.conf
+          mkdir -p /data/var/lock /data/var/run /data/var/log /data/var/opkg-lists \
+                   /data/var/opkg-db /data/var/opkg-db/info /data/opt /data/tmp
+          chown 1000:1000 /data/opt
+          chown 1000:1000 /data/var/opkg-lists /data/var/opkg-db
+          chmod 777 /data/var/lock /data/var/run /data/var/log
+          touch /data/var/resolv.conf
+          chmod 666 /data/var/resolv.conf
 
-mount --bind /data/opt /opt
-mount -t tmpfs tmpfs /tmp
-chmod 1777 /tmp
+          mount --bind /data/opt /opt
+          mount -t tmpfs tmpfs /tmp
+          chmod 1777 /tmp
 
-mkdir -p /home/user
-chown 1000:1000 /home/user
+          mkdir -p /home/user
+          chown 1000:1000 /home/user
 
-export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin
-export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
-export HOME=/home/user
-export PS1='user@tinylinux:\w\$ '
+          export PATH=/opt/usr/bin:/opt/bin:/usr/bin:/bin
+          export LD_LIBRARY_PATH=/opt/usr/lib:/opt/lib:/usr/lib:/lib
+          export HOME=/home/user
+          export PS1='user@tinylinux:\w\$ '
 
-echo
-echo "Welcome to Tiny Linux"
-echo "  home : /home/user (password protected)"
-echo "  games: play"
-echo
+          echo
+          echo "Welcome to Tiny Linux"
+          echo "  home : /home/user (password protected)"
+          echo "  games: /home/user/games/menu.sh"
+          echo
 
-exec /bin/busybox setsid /bin/busybox setuidgid 1000 \
-     /bin/busybox cttyhack /bin/sh
-INITEOF
+          exec /bin/busybox setsid /bin/busybox setuidgid 1000 \
+               /bin/busybox cttyhack /bin/sh
+          INITEOF
           sudo chmod +x /mnt/sys/sbin/init
 
           sudo chown -R 0:0 /mnt/sys
@@ -416,7 +409,7 @@ INITEOF
           sudo chmod u-s /mnt/sys/usr/bin/opkg
           cd / && sudo umount /mnt/sys
 
-      - name: Build encrypted userdata (layer 1 LUKS, key in TPM)
+      - name: Build encrypted userdata
         run: |
           set -e
           dd if=/dev/urandom of=luks.key bs=32 count=1
@@ -427,164 +420,158 @@ INITEOF
           sudo mkdir -p /mnt/data
           sudo mount /dev/mapper/data_crypt /mnt/data
 
-          # 游戏模板（首次启动时拷进 home.img）
           sudo mkdir -p /mnt/data/.templates/games
 
           sudo tee /mnt/data/.templates/games/guess.sh > /dev/null <<'GAMEEOF'
-#!/bin/sh
-n=$(( (RANDOM % 100) + 1 )); tries=0
-echo "猜数字 1-100 (q退出)"
-while :; do
-  printf "> "; read g
-  [ "$g" = "q" ] && exit 0
-  case "$g" in *[!0-9]*|'') echo "  输数字"; continue ;; esac
-  tries=$((tries+1))
-  [ "$g" -lt "$n" ] && echo "  小了"
-  [ "$g" -gt "$n" ] && echo "  大了"
-  [ "$g" = "$n" ] && { echo "  对！$tries 次"; break; }
-done
-GAMEEOF
+          #!/bin/sh
+          n=$(( (RANDOM % 100) + 1 )); tries=0
+          echo "猜数字 1-100 (q退出)"
+          while :; do
+              printf "> "; read g
+              [ "$g" = "q" ] && exit 0
+              case "$g" in *[!0-9]*|'') echo "  输数字"; continue ;; esac
+              tries=$((tries+1))
+              [ "$g" -lt "$n" ] && echo "  小了"
+              [ "$g" -gt "$n" ] && echo "  大了"
+              [ "$g" = "$n" ] && { echo "  对！$tries 次"; break; }
+          done
+          GAMEEOF
 
           sudo tee /mnt/data/.templates/games/rps.sh > /dev/null <<'GAMEEOF'
-#!/bin/sh
-echo "1石头 2剪刀 3布 (q退出)"
-w=0; l=0; d=0
-while :; do
-  printf "> "; read u
-  [ "$u" = "q" ] && break
-  case "$u" in 1|2|3) ;; *) echo "1/2/3"; continue ;; esac
-  c=$(( (RANDOM % 3) + 1 ))
-  [ "$u" = "$c" ] && { echo "  平"; d=$((d+1)); continue; }
-  case "$u$c" in 12|23|31) echo "  赢"; w=$((w+1)) ;; *) echo "  输"; l=$((l+1)) ;; esac
-done
-echo "战绩 W$w L$l D$d"
-GAMEEOF
+          #!/bin/sh
+          echo "1石头 2剪刀 3布 (q退出)"
+          w=0; l=0; d=0
+          while :; do
+              printf "> "; read u
+              [ "$u" = "q" ] && break
+              case "$u" in 1|2|3) ;; *) echo "1/2/3"; continue ;; esac
+              c=$(( (RANDOM % 3) + 1 ))
+              [ "$u" = "$c" ] && { echo "  平"; d=$((d+1)); continue; }
+              case "$u$c" in 12|23|31) echo "  赢"; w=$((w+1)) ;; *) echo "  输"; l=$((l+1)) ;; esac
+          done
+          echo "战绩 W$w L$l D$d"
+          GAMEEOF
 
           sudo tee /mnt/data/.templates/games/dice.sh > /dev/null <<'GAMEEOF'
-#!/bin/sh
-sides=${1:-6}; count=${2:-1}; i=0; total=0
-echo "掷 $count 个 $sides 面骰"
-while [ $i -lt $count ]; do
-  r=$(( (RANDOM % sides) + 1 )); total=$((total+r))
-  echo "  #$((i+1)): $r"; i=$((i+1))
-done
-[ "$count" -gt 1 ] && echo "  总计 $total"
-GAMEEOF
+          #!/bin/sh
+          sides=${1:-6}; count=${2:-1}; i=0; total=0
+          echo "掷 $count 个 $sides 面骰"
+          while [ $i -lt $count ]; do
+              r=$(( (RANDOM % sides) + 1 )); total=$((total+r))
+              echo "  #$((i+1)): $r"; i=$((i+1))
+          done
+          [ "$count" -gt 1 ] && echo "  总计 $total"
+          GAMEEOF
 
           sudo tee /mnt/data/.templates/games/blackjack.sh > /dev/null <<'GAMEEOF'
-#!/bin/sh
-d() { echo $(( (RANDOM % 10) + 1 )); }
-p1=$(d); p2=$(d); ps=$((p1+p2))
-echo "你的牌 $p1 $p2 (总$ps)"
-while :; do
-  printf "要牌(y/n)> "; read a
-  case "$a" in
-    y|Y) c=$(d); ps=$((ps+c)); echo "  +$c (总$ps)"
-         [ "$ps" -gt 21 ] && { echo "  爆！"; exit 0; } ;;
-    n|N) break ;;
-    *) echo "  y/n" ;;
-  esac
-done
-cs=0; echo "电脑抽..."
-while [ "$cs" -lt 17 ]; do
-  c=$(d); cs=$((cs+c)); echo "  电脑+$c (总$cs)"
-  [ "$cs" -gt 21 ] && { echo "电脑爆！赢"; exit 0; }
-done
-echo "  你$ps 电脑$cs"
-[ "$ps" -gt "$cs" ] && echo "  你赢"
-[ "$ps" -lt "$cs" ] && echo "  你输"
-[ "$ps" = "$cs" ] && echo "  平"
-GAMEEOF
+          #!/bin/sh
+          d() { echo $(( (RANDOM % 10) + 1 )); }
+          p1=$(d); p2=$(d); ps=$((p1+p2))
+          echo "你的牌 $p1 $p2 (总$ps)"
+          while :; do
+              printf "要牌(y/n)> "; read a
+              case "$a" in
+                  y|Y) c=$(d); ps=$((ps+c)); echo "  +$c (总$ps)"
+                       [ "$ps" -gt 21 ] && { echo "  爆！"; exit 0; } ;;
+                  n|N) break ;;
+                  *) echo "  y/n" ;;
+              esac
+          done
+          cs=0; echo "电脑抽..."
+          while [ "$cs" -lt 17 ]; do
+              c=$(d); cs=$((cs+c)); echo "  电脑+$c (总$cs)"
+              [ "$cs" -gt 21 ] && { echo "电脑爆！赢"; exit 0; }
+          done
+          echo "  你$ps 电脑$cs"
+          [ "$ps" -gt "$cs" ] && echo "  你赢"
+          [ "$ps" -lt "$cs" ] && echo "  你输"
+          [ "$ps" = "$cs" ] && echo "  平"
+          GAMEEOF
 
           sudo tee /mnt/data/.templates/games/tictactoe.sh > /dev/null <<'GAMEEOF'
-#!/bin/sh
-board="123456789"
-show() {
-  for i in 1 2 3; do
-    a=$(echo "$board" | cut -c$((i*3-2)))
-    b=$(echo "$board" | cut -c$((i*3-1)))
-    c=$(echo "$board" | cut -c$((i*3)))
-    echo "  $a | $b | $c"
-    [ $i -lt 3 ] && echo " ---+---+---"
-  done
-  echo
-}
-echo "井字棋"
-turn=X
-for t in 1 2 3 4 5 6 7 8 9; do
-  show
-  printf "玩家$turn > "; read pos
-  case "$pos" in [1-9]) ;; *) t=$((t-1)); continue ;; esac
-  old=$(echo "$board" | cut -c$pos)
-  case "$old" in X|O) echo "已占"; t=$((t-1)); continue ;; esac
-  board=$(echo "$board" | sed "s/$old/$turn/")
-  for p in "1 2 3" "4 5 6" "7 8 9" "1 4 7" "2 5 8" "3 6 9" "1 5 9" "3 5 7"; do
-    set -- $p
-    a=$(echo "$board" | cut -c$1); b=$(echo "$board" | cut -c$2); c=$(echo "$board" | cut -c$3)
-    [ "$a" = "$b" ] && [ "$b" = "$c" ] && [ "$a" = "$turn" ] && { show; echo "玩家$turn 赢！"; exit 0; }
-  done
-  [ "$turn" = "X" ] && turn=O || turn=X
-done
-show; echo "平局"
-GAMEEOF
+          #!/bin/sh
+          board="123456789"
+          show() {
+              for i in 1 2 3; do
+                  a=$(echo "$board" | cut -c$((i*3-2)))
+                  b=$(echo "$board" | cut -c$((i*3-1)))
+                  c=$(echo "$board" | cut -c$((i*3)))
+                  echo "  $a | $b | $c"
+                  [ $i -lt 3 ] && echo " ---+---+---"
+              done
+              echo
+          }
+          echo "井字棋"
+          turn=X
+          for t in 1 2 3 4 5 6 7 8 9; do
+              show
+              printf "玩家$turn > "; read pos
+              case "$pos" in [1-9]) ;; *) t=$((t-1)); continue ;; esac
+              old=$(echo "$board" | cut -c$pos)
+              case "$old" in X|O) echo "已占"; t=$((t-1)); continue ;; esac
+              board=$(echo "$board" | sed "s/$old/$turn/")
+              for p in "1 2 3" "4 5 6" "7 8 9" "1 4 7" "2 5 8" "3 6 9" "1 5 9" "3 5 7"; do
+                  set -- $p
+                  a=$(echo "$board" | cut -c$1); b=$(echo "$board" | cut -c$2); c=$(echo "$board" | cut -c$3)
+                  [ "$a" = "$b" ] && [ "$b" = "$c" ] && [ "$a" = "$turn" ] && { show; echo "玩家$turn 赢！"; exit 0; }
+              done
+              [ "$turn" = "X" ] && turn=O || turn=X
+          done
+          show; echo "平局"
+          GAMEEOF
 
           sudo tee /mnt/data/.templates/games/hilo.sh > /dev/null <<'GAMEEOF'
-#!/bin/sh
-echo "大小猜 (2-12)"; score=0
-while :; do
-  printf "押大(h)/小(l)/退出(q)> "; read c
-  [ "$c" = "q" ] && { echo "总分 $score"; exit 0; }
-  case "$c" in h|l) ;; *) continue ;; esac
-  roll=$(( (RANDOM % 6) + (RANDOM % 6) + 2 ))
-  echo "  掷出 $roll"
-  [ "$roll" = "7" ] && { echo "  7，平"; continue; }
-  if [ "$c" = "h" ] && [ "$roll" -gt 7 ]; then echo "  赢"; score=$((score+1))
-  elif [ "$c" = "l" ] && [ "$roll" -lt 7 ]; then echo "  赢"; score=$((score+1))
-  else echo "  输"; score=$((score-1)); fi
-  echo "  总分 $score"
-done
-GAMEEOF
+          #!/bin/sh
+          echo "大小猜 (2-12)"; score=0
+          while :; do
+              printf "押大(h)/小(l)/退出(q)> "; read c
+              [ "$c" = "q" ] && { echo "总分 $score"; exit 0; }
+              case "$c" in h|l) ;; *) continue ;; esac
+              roll=$(( (RANDOM % 6) + (RANDOM % 6) + 2 ))
+              echo "  掷出 $roll"
+              [ "$roll" = "7" ] && { echo "  7，平"; continue; }
+              if [ "$c" = "h" ] && [ "$roll" -gt 7 ]; then echo "  赢"; score=$((score+1))
+              elif [ "$c" = "l" ] && [ "$roll" -lt 7 ]; then echo "  赢"; score=$((score+1))
+              else echo "  输"; score=$((score-1)); fi
+              echo "  总分 $score"
+          done
+          GAMEEOF
 
           sudo tee /mnt/data/.templates/games/menu.sh > /dev/null <<'MENUEOF'
-#!/bin/sh
-while :; do
-  clear 2>/dev/null
-  echo "================================"
-  echo "  小游戏合集"
-  echo "================================"
-  echo "  1) 猜数字"
-  echo "  2) 石头剪刀布"
-  echo "  3) 掷骰子 x3"
-  echo "  4) 21 点"
-  echo "  5) 井字棋"
-  echo "  6) 大小猜"
-  echo "  q) 退出"
-  printf "选择 > "; read c
-  case "$c" in
-    1) /home/user/games/guess.sh ;;
-    2) /home/user/games/rps.sh ;;
-    3) /home/user/games/dice.sh 6 3 ;;
-    4) /home/user/games/blackjack.sh ;;
-    5) /home/user/games/tictactoe.sh ;;
-    6) /home/user/games/hilo.sh ;;
-    q|Q) exit 0 ;;
-  esac
-  printf "回车继续..."; read _
-done
-MENUEOF
+          #!/bin/sh
+          while :; do
+              clear 2>/dev/null
+              echo "================================"
+              echo "  小游戏合集"
+              echo "================================"
+              echo "  1) 猜数字"
+              echo "  2) 石头剪刀布"
+              echo "  3) 掷骰子 x3"
+              echo "  4) 21 点"
+              echo "  5) 井字棋"
+              echo "  6) 大小猜"
+              echo "  q) 退出"
+              printf "选择 > "; read c
+              case "$c" in
+                  1) /home/user/games/guess.sh ;;
+                  2) /home/user/games/rps.sh ;;
+                  3) /home/user/games/dice.sh 6 3 ;;
+                  4) /home/user/games/blackjack.sh ;;
+                  5) /home/user/games/tictactoe.sh ;;
+                  6) /home/user/games/hilo.sh ;;
+                  q|Q) exit 0 ;;
+              esac
+              printf "回车继续..."; read _
+          done
+          MENUEOF
 
-          sudo tee /mnt/data/.templates/games/play > /dev/null <<'PLAYEOF'
-#!/bin/sh
-exec /home/user/games/menu.sh
-PLAYEOF
-
-          sudo chmod 755 /mnt/data/.templates/games/*.sh /mnt/data/.templates/games/play
+          sudo chmod 755 /mnt/data/.templates/games/*.sh
           sudo chown -R 0:0 /mnt/data/.templates
 
           sudo umount /mnt/data
           cryptsetup luksClose data_crypt
 
-      - name: Setup swtpm and seal LUKS key
+      - name: Setup swtpm
         run: |
           set -e
           rm -rf swtpm-state && mkdir -p swtpm-state
@@ -611,6 +598,7 @@ PLAYEOF
           SALT=00112233445566778899aabbccddeeff
           BLOCKS=$((384 * 256))
           veritysetup format --salt=$SALT --data-blocks=$BLOCKS system.img system.img.verity > /tmp/verity.out 2>&1
+          cat /tmp/verity.out | tail -20
           ROOT_HASH=$(grep 'Root hash:' /tmp/verity.out | awk '{print $NF}')
           [ -z "$ROOT_HASH" ] && { cat /tmp/verity.out; exit 1; }
           echo "$SALT" > /tmp/salt.txt
@@ -628,44 +616,47 @@ PLAYEOF
             ln -sf busybox $c
           done
           cd ../..
+
           cat > initramfs/init <<'INITEOF'
-#!/bin/busybox sh
-/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
-[ -c /dev/console ] || /bin/busybox mknod /dev/console c 5 1
-[ -c /dev/ttyS0 ]   || /bin/busybox mknod /dev/ttyS0 c 4 64
-chmod 600 /dev/console /dev/ttyS0 2>/dev/null
-exec </dev/ttyS0 >/dev/ttyS0 2>&1
-/bin/busybox mount -t proc none /proc
-/bin/busybox mount -t sysfs none /sys
-echo
-echo "=== dm-verity boot ==="
-i=0
-while [ $i -lt 15 ]; do
-  [ -b /dev/dm-0 ] && break
-  /bin/busybox sleep 1; i=$((i+1))
-done
-if [ ! -b /dev/dm-0 ]; then
-  echo "######################################"
-  echo "#  DM-VERITY FAILED — TAMPERED       #"
-  echo "#  REFUSING TO BOOT.                 #"
-  echo "######################################"
-  /bin/busybox sleep 15
-  /bin/busybox poweroff -f
-  while true; do /bin/busybox sleep 3600; done
-fi
-if ! /bin/busybox mount -o ro /dev/dm-0 /sysroot; then
-  echo "FATAL: mount failed"
-  /bin/busybox sleep 10
-  /bin/busybox poweroff -f
-  while true; do /bin/busybox sleep 3600; done
-fi
-echo "Integrity OK."
-/bin/busybox mount --move /proc /sysroot/proc
-/bin/busybox mount --move /sys  /sysroot/sys
-/bin/busybox mount --move /dev  /sysroot/dev
-exec /bin/busybox switch_root /sysroot /sbin/init
-INITEOF
+          #!/bin/busybox sh
+          /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+          [ -c /dev/console ] || /bin/busybox mknod /dev/console c 5 1
+          [ -c /dev/ttyS0 ]   || /bin/busybox mknod /dev/ttyS0 c 4 64
+          chmod 600 /dev/console /dev/ttyS0 2>/dev/null
+          exec </dev/ttyS0 >/dev/ttyS0 2>&1
+          /bin/busybox mount -t proc none /proc
+          /bin/busybox mount -t sysfs none /sys
+          echo
+          echo "=== dm-verity boot ==="
+          i=0
+          while [ $i -lt 15 ]; do
+              [ -b /dev/dm-0 ] && break
+              /bin/busybox sleep 1; i=$((i+1))
+          done
+          if [ ! -b /dev/dm-0 ]; then
+              echo "######################################"
+              echo "#  DM-VERITY FAILED — TAMPERED       #"
+              echo "#  REFUSING TO BOOT.                 #"
+              echo "######################################"
+              /bin/busybox sleep 15
+              /bin/busybox poweroff -f
+              while true; do /bin/busybox sleep 3600; done
+          fi
+          if ! /bin/busybox mount -o ro /dev/dm-0 /sysroot; then
+              echo "FATAL: mount failed"
+              /bin/busybox sleep 10
+              /bin/busybox poweroff -f
+              while true; do /bin/busybox sleep 3600; done
+          fi
+          echo "Integrity OK."
+          /bin/busybox mount --move /proc /sysroot/proc
+          /bin/busybox mount --move /sys  /sysroot/sys
+          /bin/busybox mount --move /dev  /sysroot/dev
+          exec /bin/busybox switch_root /sysroot /sbin/init
+          INITEOF
           chmod +x initramfs/init
+          echo ">>> initramfs:"
+          ls -la initramfs/ && cat initramfs/init | head -3
 
       - name: Download kernel
         run: |

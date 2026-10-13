@@ -588,15 +588,13 @@ jobs:
             --tpm2 \
             --ctrl type=unixio,path=$PWD/swtpm.sock.ctrl \
             --server type=unixio,path=$PWD/swtpm.sock \
+            --flags startup-clear \
             --daemon
           sleep 3
 
           ls -la $PWD/swtpm.sock $PWD/swtpm.sock.ctrl
 
           export TPM2TOOLS_TCTI="swtpm:path=$PWD/swtpm.sock"
-
-          tpm2_startup -c || true
-
           tpm2_createprimary -C o -g sha256 -G rsa -c primary.ctx
           tpm2_create -C primary.ctx -g sha256 -i luks.key -u sealed.pub -r sealed.priv
           ls -la primary.ctx sealed.pub sealed.priv

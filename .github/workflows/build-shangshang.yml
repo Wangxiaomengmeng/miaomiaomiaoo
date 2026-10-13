@@ -586,7 +586,7 @@ jobs:
           swtpm socket \
             --tpmstate dir=$PWD/swtpm-state \
             --tpm2 \
-            --ctrl type=unixio,path=$PWD/swtpm.ctrl \
+            --ctrl type=unixio,path=$PWD/swtpm.sock.ctrl \
             --server type=unixio,path=$PWD/swtpm.sock \
             --flags not-need-init \
             --daemon

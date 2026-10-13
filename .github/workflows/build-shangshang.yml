@@ -592,7 +592,7 @@ jobs:
             --daemon
           sleep 3
 
-          ls -la $PWD/swtpm.ctrl $PWD/swtpm.sock
+          ls -la $PWD/swtpm.sock $PWD/swtpm.sock.ctrl
 
           export TPM2TOOLS_TCTI="swtpm:path=$PWD/swtpm.sock"
           tpm2_createprimary -C o -g sha256 -G rsa -c primary.ctx

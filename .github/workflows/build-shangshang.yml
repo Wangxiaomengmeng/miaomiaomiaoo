@@ -1,4 +1,4 @@
-name: Tiny Linux (TPM + LUKS + duress + SecureBoot + games)
+name: Tiny Linux (TPM + LUKS + duress + SecureBoot + 9 games)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,6 @@ jobs:
           pip3 install --user --upgrade pip setuptools wheel
           pip3 install --user virt-firmware
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          $HOME/.local/bin/virt-fw-vars --help | head -3 || true
 
       - name: Generate Secure Boot keys
         run: |
@@ -64,7 +63,6 @@ jobs:
           BASE=http://downloads.openwrt.org/releases/23.05.2/packages/x86_64
           wget -q -O base.list     "$BASE/base/Packages"
           wget -q -O packages.list "$BASE/packages/Packages"
-
           PKGS="tpm2-tools libtss2 libtss2-tcti-device cryptsetup libcryptsetup \
                 libdevmapper libjson-c libjson-c5 libpopt libuuid zlib libopenssl3 \
                 libblkid libmount libcap libcap-ng libseccomp"
@@ -79,8 +77,6 @@ jobs:
                   fi
               done
           done
-          echo ">>> Downloaded $(ls *.ipk 2>/dev/null | wc -l) packages"
-
           for ipk in *.ipk; do
               [ -f "$ipk" ] || continue
               d=$(mktemp -d); cd "$d"
@@ -89,10 +85,13 @@ jobs:
               [ -f data.tar.xz ] && tar -xJf data.tar.xz -C /tmp/pkgroot 2>/dev/null || true
               cd "$OLDPWD"; rm -rf "$d"
           done
-          echo ">>> tpm2 tools:"
-          ls /tmp/pkgroot/usr/bin/ 2>/dev/null | grep tpm2 || echo "none"
-          echo ">>> cryptsetup:"
-          ls /tmp/pkgroot/usr/sbin/ 2>/dev/null | grep cryptsetup || echo "none"
+          ls /tmp/pkgroot/usr/bin/ 2>/dev/null | grep tpm2 || echo "no tpm2"
+          ls /tmp/pkgroot/usr/sbin/ 2>/dev/null | grep cryptsetup || echo "no cryptsetup"
+
+      - name: Generate LUKS key
+        run: |
+          dd if=/dev/urandom of=luks.key bs=32 count=1
+          ls -la luks.key
 
       - name: Build system image
         run: |
@@ -103,7 +102,7 @@ jobs:
 
           sudo cp -a busybox-1.36.1/_install/* /mnt/sys/
           sudo mkdir -p /mnt/sys/{proc,sys,dev,etc,sbin,bin,usr/bin,usr/sbin,usr/lib,usr/share/udhcpc,var,lib,home,opt,root,tmp,data}
-          sudo mkdir -p /mnt/sys/home/user /mnt/sys/etc/tpm /mnt/sys/dev/mapper
+          sudo mkdir -p /mnt/sys/home/user /mnt/sys/etc/tpm /mnt/sys/dev/mapper /mnt/sys/etc/games
 
           sudo cp busybox-1.36.1/examples/udhcp/simple.script /mnt/sys/usr/share/udhcpc/default.script
           sudo chmod +x /mnt/sys/usr/share/udhcpc/default.script
@@ -120,6 +119,10 @@ jobs:
           sudo cp -a /tmp/pkgroot/usr/sbin/. /mnt/sys/usr/sbin/ 2>/dev/null || true
           sudo cp -a /tmp/pkgroot/lib/.      /mnt/sys/lib/      2>/dev/null || true
           sudo cp -a /tmp/pkgroot/usr/lib/.  /mnt/sys/usr/lib/  2>/dev/null || true
+
+          sudo cp luks.key /mnt/sys/etc/luks.key
+          sudo chmod 600 /mnt/sys/etc/luks.key
+          sudo chown 0:0 /mnt/sys/etc/luks.key
 
           sudo find /mnt/sys -name su -type l -delete
           sudo rm -f /mnt/sys/bin/su /mnt/sys/sbin/su /mnt/sys/usr/bin/su
@@ -259,9 +262,7 @@ jobs:
                   printf "Set USER password (>=8 chars, letters+digits): "
                   read pw1
                   len=${#pw1}
-                  if [ "$len" -lt 8 ]; then
-                      echo "  [x] too short"; continue
-                  fi
+                  [ "$len" -lt 8 ] && { echo "  [x] too short"; continue; }
                   has_digit=0; has_letter=0
                   case "$pw1" in *[0-9]*) has_digit=1 ;; esac
                   case "$pw1" in *[a-zA-Z]*) has_letter=1 ;; esac
@@ -280,12 +281,8 @@ jobs:
                   printf "Set DURESS password (must differ, >=8 chars): "
                   read dp1
                   len=${#dp1}
-                  if [ "$len" -lt 8 ]; then
-                      echo "  [x] too short"; continue
-                  fi
-                  if [ "$dp1" = "$USER_PW" ]; then
-                      echo "  [x] must differ"; continue
-                  fi
+                  [ "$len" -lt 8 ] && { echo "  [x] too short"; continue; }
+                  [ "$dp1" = "$USER_PW" ] && { echo "  [x] must differ"; continue; }
                   printf "Confirm DURESS password: "
                   read dp2
                   [ "$dp1" = "$dp2" ] || { echo "  [x] mismatch"; continue; }
@@ -308,11 +305,13 @@ jobs:
               mkdir -p /home
               mount /dev/mapper/home_crypt /home
 
-              mkdir -p /home/user
+              mkdir -p /home/user/games
               if [ -d /data/.templates/games ]; then
-                  cp -a /data/.templates/games /home/user/
+                  cp -a /data/.templates/games/. /home/user/games/
               fi
               chown -R 1000:1000 /home/user
+              chmod 700 /home/user/games
+              chmod 700 /home/user/games/*.sh 2>/dev/null
 
               sync
               umount /home
@@ -400,8 +399,8 @@ jobs:
 
           echo
           echo "Welcome to Tiny Linux"
-          echo "  home : /home/user (password protected)"
-          echo "  games: /home/user/games/menu.sh"
+          echo "  home : /home/user (encrypted)"
+          echo "  games: play  (9 games)"
           echo
 
           exec /bin/busybox setsid /bin/busybox setuidgid 1000 \
@@ -409,101 +408,147 @@ jobs:
           INITEOF
           sudo chmod +x /mnt/sys/sbin/init
 
+          # ============ play 包装器 ============
+          sudo mkdir -p /mnt/sys/opt/bin
+          sudo tee /mnt/sys/opt/bin/play > /dev/null <<'PLAYEOF'
+          #!/bin/sh
+          # 环境指纹检查
+          [ "$(id -u)" = "1000" ] || { echo "SECURITY: wrong uid"; exit 1; }
+          [ "$(hostname)" = "tinylinux" ] || { echo "SECURITY: wrong host"; exit 1; }
+          [ "$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)" = "1" ] || { echo "SECURITY: kernel not locked"; exit 1; }
+          [ "$(cat /proc/sys/kernel/kexec_load_disabled 2>/dev/null)" = "1" ] || { echo "SECURITY: kexec not disabled"; exit 1; }
+          [ -f /data/.initialized ] || { echo "SECURITY: not initialized"; exit 1; }
+          mount 2>/dev/null | grep -q " on /home " || { echo "SECURITY: /home not mounted"; exit 1; }
+          mount 2>/dev/null | grep -q " on /opt " || { echo "SECURITY: /opt not mounted"; exit 1; }
+          [ -x /home/user/games/menu.sh ] || { echo "FATAL: games missing"; exit 1; }
+          exec /home/user/games/menu.sh
+          PLAYEOF
+          sudo chmod 755 /mnt/sys/opt/bin/play
+
           sudo chown -R 0:0 /mnt/sys
           sudo chown -R 1000:1000 /mnt/sys/home/user
           sudo chmod u-s /mnt/sys/bin/busybox
           sudo chmod u-s /mnt/sys/usr/bin/opkg
           cd / && sudo umount /mnt/sys
 
-      - name: Build encrypted userdata
+      - name: Build encrypted userdata with 9 games
         run: |
           set -e
-          dd if=/dev/urandom of=luks.key bs=32 count=1
           dd if=/dev/zero of=userdata.img bs=1M count=1024
           sudo cryptsetup luksFormat --type luks2 --key-file=luks.key --batch-mode userdata.img
           sudo cryptsetup luksOpen --key-file=luks.key userdata.img data_crypt
           sudo mkfs.ext4 -F /dev/mapper/data_crypt
           sudo mkdir -p /mnt/data
           sudo mount /dev/mapper/data_crypt /mnt/data
-
           sudo mkdir -p /mnt/data/.templates/games
 
-          sudo tee /mnt/data/.templates/games/guess.sh > /dev/null <<'GAMEEOF'
+          # ---------- 游戏模板（含 verify 函数）----------
+          # 统一前缀
+          read -r -d '' VERIFY_BLOCK <<'VERIFYEOF' || true
+          verify() {
+              [ "$(id -u)" = "1000" ] || { echo "SECURITY: wrong uid"; exit 1; }
+              [ "$(hostname)" = "tinylinux" ] || { echo "SECURITY: wrong host"; exit 1; }
+              [ "$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)" = "1" ] || { echo "SECURITY: kernel unlocked"; exit 1; }
+              [ -f /data/.initialized ] || { echo "SECURITY: no init marker"; exit 1; }
+              mount 2>/dev/null | grep -q " on /home " || { echo "SECURITY: home not mounted"; exit 1; }
+              if [ -f /etc/games/manifest ]; then
+                  N=$(basename "$0")
+                  M=$(grep "^$N " /etc/games/manifest 2>/dev/null | cut -d' ' -f2)
+                  if [ -n "$M" ]; then
+                      A=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)
+                      [ "$A" = "$M" ] || { echo "SECURITY: $N modified"; exit 1; }
+                  fi
+              fi
+          }
+          verify
+          VERIFYEOF
+
+          # -------- 1. guess.sh --------
+          sudo tee /mnt/data/.templates/games/guess.sh > /dev/null <<GAMEEOF
           #!/bin/sh
-          n=$(( (RANDOM % 100) + 1 )); tries=0
+          ${VERIFY_BLOCK}
+          n=\$(( (RANDOM % 100) + 1 )); tries=0
           echo "猜数字 1-100 (q退出)"
           while :; do
               printf "> "; read g
-              [ "$g" = "q" ] && exit 0
-              case "$g" in *[!0-9]*|'') echo "  输数字"; continue ;; esac
-              tries=$((tries+1))
-              [ "$g" -lt "$n" ] && echo "  小了"
-              [ "$g" -gt "$n" ] && echo "  大了"
-              [ "$g" = "$n" ] && { echo "  对！$tries 次"; break; }
+              [ "\$g" = "q" ] && exit 0
+              case "\$g" in *[!0-9]*|'') echo "  输数字"; continue ;; esac
+              tries=\$((tries+1))
+              [ "\$g" -lt "\$n" ] && echo "  小了"
+              [ "\$g" -gt "\$n" ] && echo "  大了"
+              [ "\$g" = "\$n" ] && { echo "  对！\$tries 次"; break; }
           done
           GAMEEOF
 
-          sudo tee /mnt/data/.templates/games/rps.sh > /dev/null <<'GAMEEOF'
+          # -------- 2. rps.sh --------
+          sudo tee /mnt/data/.templates/games/rps.sh > /dev/null <<GAMEEOF
           #!/bin/sh
+          ${VERIFY_BLOCK}
           echo "1石头 2剪刀 3布 (q退出)"
           w=0; l=0; d=0
           while :; do
               printf "> "; read u
-              [ "$u" = "q" ] && break
-              case "$u" in 1|2|3) ;; *) echo "1/2/3"; continue ;; esac
-              c=$(( (RANDOM % 3) + 1 ))
-              [ "$u" = "$c" ] && { echo "  平"; d=$((d+1)); continue; }
-              case "$u$c" in 12|23|31) echo "  赢"; w=$((w+1)) ;; *) echo "  输"; l=$((l+1)) ;; esac
+              [ "\$u" = "q" ] && break
+              case "\$u" in 1|2|3) ;; *) echo "1/2/3"; continue ;; esac
+              c=\$(( (RANDOM % 3) + 1 ))
+              [ "\$u" = "\$c" ] && { echo "  平"; d=\$((d+1)); continue; }
+              case "\$u\$c" in 12|23|31) echo "  赢"; w=\$((w+1)) ;; *) echo "  输"; l=\$((l+1)) ;; esac
           done
-          echo "战绩 W$w L$l D$d"
+          echo "战绩 W\$w L\$l D\$d"
           GAMEEOF
 
-          sudo tee /mnt/data/.templates/games/dice.sh > /dev/null <<'GAMEEOF'
+          # -------- 3. dice.sh --------
+          sudo tee /mnt/data/.templates/games/dice.sh > /dev/null <<GAMEEOF
           #!/bin/sh
-          sides=${1:-6}; count=${2:-1}; i=0; total=0
-          echo "掷 $count 个 $sides 面骰"
-          while [ $i -lt $count ]; do
-              r=$(( (RANDOM % sides) + 1 )); total=$((total+r))
-              echo "  #$((i+1)): $r"; i=$((i+1))
+          ${VERIFY_BLOCK}
+          sides=\${1:-6}; count=\${2:-1}; i=0; total=0
+          echo "掷 \$count 个 \$sides 面骰"
+          while [ \$i -lt \$count ]; do
+              r=\$(( (RANDOM % sides) + 1 )); total=\$((total+r))
+              echo "  #\$((i+1)): \$r"; i=\$((i+1))
           done
-          [ "$count" -gt 1 ] && echo "  总计 $total"
+          [ "\$count" -gt 1 ] && echo "  总计 \$total"
           GAMEEOF
 
-          sudo tee /mnt/data/.templates/games/blackjack.sh > /dev/null <<'GAMEEOF'
+          # -------- 4. blackjack.sh --------
+          sudo tee /mnt/data/.templates/games/blackjack.sh > /dev/null <<GAMEEOF
           #!/bin/sh
-          d() { echo $(( (RANDOM % 10) + 1 )); }
-          p1=$(d); p2=$(d); ps=$((p1+p2))
-          echo "你的牌 $p1 $p2 (总$ps)"
+          ${VERIFY_BLOCK}
+          d() { echo \$(( (RANDOM % 10) + 1 )); }
+          p1=\$(d); p2=\$(d); ps=\$((p1+p2))
+          echo "你的牌 \$p1 \$p2 (总\$ps)"
           while :; do
               printf "要牌(y/n)> "; read a
-              case "$a" in
-                  y|Y) c=$(d); ps=$((ps+c)); echo "  +$c (总$ps)"
-                       [ "$ps" -gt 21 ] && { echo "  爆！"; exit 0; } ;;
+              case "\$a" in
+                  y|Y) c=\$(d); ps=\$((ps+c)); echo "  +\$c (总\$ps)"
+                       [ "\$ps" -gt 21 ] && { echo "  爆！"; exit 0; } ;;
                   n|N) break ;;
                   *) echo "  y/n" ;;
               esac
           done
           cs=0; echo "电脑抽..."
-          while [ "$cs" -lt 17 ]; do
-              c=$(d); cs=$((cs+c)); echo "  电脑+$c (总$cs)"
-              [ "$cs" -gt 21 ] && { echo "电脑爆！赢"; exit 0; }
+          while [ "\$cs" -lt 17 ]; do
+              c=\$(d); cs=\$((cs+c)); echo "  电脑+\$c (总\$cs)"
+              [ "\$cs" -gt 21 ] && { echo "电脑爆！赢"; exit 0; }
           done
-          echo "  你$ps 电脑$cs"
-          [ "$ps" -gt "$cs" ] && echo "  你赢"
-          [ "$ps" -lt "$cs" ] && echo "  你输"
-          [ "$ps" = "$cs" ] && echo "  平"
+          echo "  你\$ps 电脑\$cs"
+          [ "\$ps" -gt "\$cs" ] && echo "  你赢"
+          [ "\$ps" -lt "\$cs" ] && echo "  你输"
+          [ "\$ps" = "\$cs" ] && echo "  平"
           GAMEEOF
 
-          sudo tee /mnt/data/.templates/games/tictactoe.sh > /dev/null <<'GAMEEOF'
+          # -------- 5. tictactoe.sh --------
+          sudo tee /mnt/data/.templates/games/tictactoe.sh > /dev/null <<GAMEEOF
           #!/bin/sh
+          ${VERIFY_BLOCK}
           board="123456789"
           show() {
               for i in 1 2 3; do
-                  a=$(echo "$board" | cut -c$((i*3-2)))
-                  b=$(echo "$board" | cut -c$((i*3-1)))
-                  c=$(echo "$board" | cut -c$((i*3)))
-                  echo "  $a | $b | $c"
-                  [ $i -lt 3 ] && echo " ---+---+---"
+                  a=\$(echo "\$board" | cut -c\$((i*3-2)))
+                  b=\$(echo "\$board" | cut -c\$((i*3-1)))
+                  c=\$(echo "\$board" | cut -c\$((i*3)))
+                  echo "  \$a | \$b | \$c"
+                  [ \$i -lt 3 ] && echo " ---+---+---"
               done
               echo
           }
@@ -511,78 +556,267 @@ jobs:
           turn=X
           for t in 1 2 3 4 5 6 7 8 9; do
               show
-              printf "玩家$turn > "; read pos
-              case "$pos" in [1-9]) ;; *) t=$((t-1)); continue ;; esac
-              old=$(echo "$board" | cut -c$pos)
-              case "$old" in X|O) echo "已占"; t=$((t-1)); continue ;; esac
-              board=$(echo "$board" | sed "s/$old/$turn/")
+              printf "玩家\$turn > "; read pos
+              case "\$pos" in [1-9]) ;; *) t=\$((t-1)); continue ;; esac
+              old=\$(echo "\$board" | cut -c\$pos)
+              case "\$old" in X|O) echo "已占"; t=\$((t-1)); continue ;; esac
+              board=\$(echo "\$board" | sed "s/\$old/\$turn/")
               for p in "1 2 3" "4 5 6" "7 8 9" "1 4 7" "2 5 8" "3 6 9" "1 5 9" "3 5 7"; do
-                  set -- $p
-                  a=$(echo "$board" | cut -c$1); b=$(echo "$board" | cut -c$2); c=$(echo "$board" | cut -c$3)
-                  [ "$a" = "$b" ] && [ "$b" = "$c" ] && [ "$a" = "$turn" ] && { show; echo "玩家$turn 赢！"; exit 0; }
+                  set -- \$p
+                  a=\$(echo "\$board" | cut -c\$1); b=\$(echo "\$board" | cut -c\$2); c=\$(echo "\$board" | cut -c\$3)
+                  [ "\$a" = "\$b" ] && [ "\$b" = "\$c" ] && [ "\$a" = "\$turn" ] && { show; echo "玩家\$turn 赢！"; exit 0; }
               done
-              [ "$turn" = "X" ] && turn=O || turn=X
+              [ "\$turn" = "X" ] && turn=O || turn=X
           done
           show; echo "平局"
           GAMEEOF
 
-          sudo tee /mnt/data/.templates/games/hilo.sh > /dev/null <<'GAMEEOF'
+          # -------- 6. hilo.sh --------
+          sudo tee /mnt/data/.templates/games/hilo.sh > /dev/null <<GAMEEOF
           #!/bin/sh
+          ${VERIFY_BLOCK}
           echo "大小猜 (2-12)"; score=0
           while :; do
               printf "押大(h)/小(l)/退出(q)> "; read c
-              [ "$c" = "q" ] && { echo "总分 $score"; exit 0; }
-              case "$c" in h|l) ;; *) continue ;; esac
-              roll=$(( (RANDOM % 6) + (RANDOM % 6) + 2 ))
-              echo "  掷出 $roll"
-              [ "$roll" = "7" ] && { echo "  7，平"; continue; }
-              if [ "$c" = "h" ] && [ "$roll" -gt 7 ]; then echo "  赢"; score=$((score+1))
-              elif [ "$c" = "l" ] && [ "$roll" -lt 7 ]; then echo "  赢"; score=$((score+1))
-              else echo "  输"; score=$((score-1)); fi
-              echo "  总分 $score"
+              [ "\$c" = "q" ] && { echo "总分 \$score"; exit 0; }
+              case "\$c" in h|l) ;; *) continue ;; esac
+              roll=\$(( (RANDOM % 6) + (RANDOM % 6) + 2 ))
+              echo "  掷出 \$roll"
+              [ "\$roll" = "7" ] && { echo "  7，平"; continue; }
+              if [ "\$c" = "h" ] && [ "\$roll" -gt 7 ]; then echo "  赢"; score=\$((score+1))
+              elif [ "\$c" = "l" ] && [ "\$roll" -lt 7 ]; then echo "  赢"; score=\$((score+1))
+              else echo "  输"; score=\$((score-1)); fi
+              echo "  总分 \$score"
           done
           GAMEEOF
 
-          sudo tee /mnt/data/.templates/games/menu.sh > /dev/null <<'MENUEOF'
+          # -------- 7. slide.sh (数字华容道) --------
+          sudo tee /mnt/data/.templates/games/slide.sh > /dev/null <<GAMEEOF
           #!/bin/sh
+          ${VERIFY_BLOCK}
+          # 3x3 滑块: 数字 1-8 加一个空格(0)，目标顺序
+          board="1 2 3 4 5 6 7 8 0"
+          # 打乱：做 30 次随机合法移动
+          shuffle() {
+              i=0
+              while [ \$i -lt 30 ]; do
+                  z=\$(echo "\$board" | awk '{for(j=1;j<=9;j++) if(\$j==0) print j}')
+                  # 空位的邻居
+                  n=""
+                  case "\$z" in
+                      1) n="2 4" ;;
+                      2) n="1 3 5" ;;
+                      3) n="2 6" ;;
+                      4) n="1 5 7" ;;
+                      5) n="2 4 6 8" ;;
+                      6) n="3 5 9" ;;
+                      7) n="4 8" ;;
+                      8) n="5 7 9" ;;
+                      9) n="6 8" ;;
+                  esac
+                  cnt=0
+                  for x in \$n; do cnt=\$((cnt+1)); done
+                  idx=\$(( (RANDOM % cnt) + 1 ))
+                  pick=\$(echo "\$n" | cut -d' ' -f\$idx)
+                  board=\$(echo "\$board" | awk -v a="\$z" -v b="\$pick" '{
+                      for(i=1;i<=9;i++) {
+                          if(i==a) printf "%s ", \$b
+                          else if(i==b) printf "%s ", \$a
+                          else printf "%s ", \$i
+                      }
+                  }')
+                  i=\$((i+1))
+              done
+          }
+          shuffle
+          show() {
+              echo
+              echo "\$board" | awk '{
+                  for(i=1;i<=9;i++) {
+                      if(\$i==0) printf "  ."
+                      else printf " %2d", \$i
+                      if(i%3==0) print ""
+                  }
+              }'
+              echo
+          }
+          move() {
+              # 找空格位置
+              z=\$(echo "\$board" | awk '{for(j=1;j<=9;j++) if(\$j==0) print j}')
+              # 找目标数字的位置
+              t=\$(echo "\$board" | awk -v v="\$1" '{for(j=1;j<=9;j++) if(\$j==v) print j}')
+              # 检查是否相邻
+              case "\$z" in
+                  1) ok="2 4" ;;
+                  2) ok="1 3 5" ;;
+                  3) ok="2 6" ;;
+                  4) ok="1 5 7" ;;
+                  5) ok="2 4 6 8" ;;
+                  6) ok="3 5 9" ;;
+                  7) ok="4 8" ;;
+                  8) ok="5 7 9" ;;
+                  9) ok="6 8" ;;
+              esac
+              for x in \$ok; do
+                  [ "\$x" = "\$t" ] && {
+                      board=\$(echo "\$board" | awk -v a="\$z" -v b="\$t" '{
+                          for(i=1;i<=9;i++) {
+                              if(i==a) printf "%s ", \$b
+                              else if(i==b) printf "%s ", \$a
+                              else printf "%s ", \$i
+                          }
+                      }')
+                      return 0
+                  }
+              done
+              echo "  不能移"
+              return 1
+          }
+          echo "华容道 (输入数字移动相邻块, q 退出)"
+          steps=0
+          while :; do
+              show
+              [ "\$board" = "1 2 3 4 5 6 7 8 0 " ] && { echo "恭喜！\$steps 步完成"; exit 0; }
+              printf "移动 > "; read m
+              [ "\$m" = "q" ] && exit 0
+              case "\$m" in [1-8]) move "\$m" && steps=\$((steps+1)) ;; *) echo "1-8" ;; esac
+          done
+          GAMEEOF
+
+          # -------- 8. hangman.sh (猜单词) --------
+          sudo tee /mnt/data/.templates/games/hangman.sh > /dev/null <<GAMEEOF
+          #!/bin/sh
+          ${VERIFY_BLOCK}
+          words="apple linux phone tiger house music ocean river cloud grape"
+          cnt=0
+          for w in \$words; do cnt=\$((cnt+1)); done
+          pick=\$(( (RANDOM % cnt) + 1 ))
+          word=\$(echo "\$words" | cut -d' ' -f\$pick)
+          len=\${#word}
+          guessed=""
+          wrong=0; max=6
+          echo "猜单词 (长度 \$len, 允许错 \$max 次)"
+          while :; do
+              out=""
+              done_count=0
+              i=1
+              while [ \$i -le \$len ]; do
+                  c=\$(echo "\$word" | cut -c\$i)
+                  case "\$guessed" in *"\$c"*) out="\$out\$c"; done_count=\$((done_count+1)) ;; *) out="\$out\_" ;; esac
+                  i=\$((i+1))
+              done
+              echo "  \$out"
+              echo "  已猜: \$guessed   剩余机会: \$((max - wrong))"
+              [ "\$done_count" = "\$len" ] && { echo "  成功！单词是: \$word"; exit 0; }
+              [ "\$wrong" -ge "\$max" ] && { echo "  失败！单词是: \$word"; exit 0; }
+              printf "猜字母 > "; read g
+              [ "\$g" = "q" ] && exit 0
+              [ \${#g} -ne 1 ] && { echo "  一个字母"; continue; }
+              case "\$guessed" in *"\$g"*) echo "  已猜过"; continue ;; esac
+              guessed="\$guessed\$g"
+              case "\$word" in *"\$g"*) echo "  对！" ;; *) echo "  错"; wrong=\$((wrong+1)) ;; esac
+          done
+          GAMEEOF
+
+          # -------- 9. reaction.sh (反应测试) --------
+          sudo tee /mnt/data/.templates/games/reaction.sh > /dev/null <<GAMEEOF
+          #!/bin/sh
+          ${VERIFY_BLOCK}
+          now_ms() { awk '{ printf "%d", \$1 * 1000 }' /proc/uptime; }
+          best=99999
+          round=0
+          echo "反应测试 (5 轮，屏幕显示 GO 后立即按回车)"
+          while [ \$round -lt 5 ]; do
+              round=\$((round+1))
+              echo
+              echo "第 \$round 轮：准备..."
+              delay=\$(( (RANDOM % 3) + 1 ))
+              sleep \$delay
+              echo "  >>> GO! <<<"
+              s=\$(now_ms)
+              read _
+              e=\$(now_ms)
+              t=\$((e - s))
+              [ \$t -lt 0 ] && t=0
+              echo "  反应: \$t ms"
+              [ \$t -lt \$best ] && best=\$t
+          done
+          echo
+          echo "最好成绩: \$best ms"
+          GAMEEOF
+
+          # -------- menu.sh --------
+          sudo tee /mnt/data/.templates/games/menu.sh > /dev/null <<GAMEEOF
+          #!/bin/sh
+          ${VERIFY_BLOCK}
           while :; do
               clear 2>/dev/null
-              echo "================================"
-              echo "  小游戏合集"
-              echo "================================"
+              echo "==================================="
+              echo "  小游戏合集 (9 个)"
+              echo "==================================="
               echo "  1) 猜数字"
               echo "  2) 石头剪刀布"
               echo "  3) 掷骰子 x3"
               echo "  4) 21 点"
               echo "  5) 井字棋"
               echo "  6) 大小猜"
+              echo "  7) 数字华容道"
+              echo "  8) 猜单词"
+              echo "  9) 反应测试"
               echo "  q) 退出"
               printf "选择 > "; read c
-              case "$c" in
+              case "\$c" in
                   1) /home/user/games/guess.sh ;;
                   2) /home/user/games/rps.sh ;;
                   3) /home/user/games/dice.sh 6 3 ;;
                   4) /home/user/games/blackjack.sh ;;
                   5) /home/user/games/tictactoe.sh ;;
                   6) /home/user/games/hilo.sh ;;
+                  7) /home/user/games/slide.sh ;;
+                  8) /home/user/games/hangman.sh ;;
+                  9) /home/user/games/reaction.sh ;;
                   q|Q) exit 0 ;;
               esac
               printf "回车继续..."; read _
           done
-          MENUEOF
+          GAMEEOF
 
-          sudo chmod 755 /mnt/data/.templates/games/*.sh
+          sudo chmod 700 /mnt/data/.templates/games/*.sh
           sudo chown -R 0:0 /mnt/data/.templates
 
           sudo umount /mnt/data
           sudo cryptsetup luksClose data_crypt
+
+      - name: Compute game manifest
+        run: |
+          set -e
+          # 重新解包模板算 sha256
+          sudo cryptsetup luksOpen --key-file=luks.key userdata.img data_crypt
+          sudo mkdir -p /mnt/data
+          sudo mount /dev/mapper/data_crypt /mnt/data
+          mkdir -p /tmp/manifest
+          for f in /mnt/data/.templates/games/*.sh; do
+              n=$(basename "$f")
+              h=$(sudo sha256sum "$f" | cut -d' ' -f1)
+              echo "$n $h"
+          done | sudo tee /tmp/manifest/games.manifest
+          sudo umount /mnt/data
+          sudo cryptsetup luksClose data_crypt
+          cat /tmp/manifest/games.manifest
+
+          # 塞进 system.img
+          sudo mkdir -p /mnt/sys && sudo mount -o loop system.img /mnt/sys
+          sudo mkdir -p /mnt/sys/etc/games
+          sudo cp /tmp/manifest/games.manifest /mnt/sys/etc/games/manifest
+          sudo chmod 644 /mnt/sys/etc/games/manifest
+          sudo chown 0:0 /mnt/sys/etc/games/manifest
+          cd / && sudo umount /mnt/sys
 
       - name: Setup swtpm and seal LUKS key
         run: |
           set -e
           rm -rf swtpm-state && mkdir -p swtpm-state
 
-          # swtpm 需要 ctrl 和 server 两个 socket
           swtpm socket \
             --tpmstate dir=$PWD/swtpm-state \
             --tpm2 \
@@ -592,12 +826,9 @@ jobs:
             --daemon
           sleep 3
 
-          ls -la $PWD/swtpm.sock $PWD/swtpm.sock.ctrl
-
           export TPM2TOOLS_TCTI="swtpm:path=$PWD/swtpm.sock"
           tpm2_createprimary -C o -g sha256 -G rsa -c primary.ctx
           tpm2_create -C primary.ctx -g sha256 -i luks.key -u sealed.pub -r sealed.priv
-          ls -la primary.ctx sealed.pub sealed.priv
 
           sudo mkdir -p /mnt/sys && sudo mount -o loop system.img /mnt/sys
           sudo cp primary.ctx sealed.pub sealed.priv /mnt/sys/etc/tpm/
@@ -614,7 +845,6 @@ jobs:
           SALT=00112233445566778899aabbccddeeff
           BLOCKS=$((384 * 256))
           veritysetup format --salt=$SALT --data-blocks=$BLOCKS system.img system.img.verity > /tmp/verity.out 2>&1
-          cat /tmp/verity.out | tail -20
           ROOT_HASH=$(grep 'Root hash:' /tmp/verity.out | awk '{print $NF}')
           [ -z "$ROOT_HASH" ] && { cat /tmp/verity.out; exit 1; }
           echo "$SALT" > /tmp/salt.txt
@@ -671,8 +901,6 @@ jobs:
           exec /bin/busybox switch_root /sysroot /sbin/init
           INITEOF
           chmod +x initramfs/init
-          echo ">>> initramfs:"
-          ls -la initramfs/
 
       - name: Download kernel
         run: |
@@ -709,11 +937,18 @@ jobs:
           scripts/config --enable DEVTMPFS_MOUNT
           scripts/config --enable BLK_DEV_INITRD
           scripts/config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/initramfs"
+
           ROOT_HASH=$(cat /tmp/root_hash.txt)
           SALT=$(cat /tmp/salt.txt)
-          BLOCKS=$((384 * 256))
-          DM="system,,,ro,0 $BLOCKS verity 1 /dev/vdb /dev/vdc 4096 4096 98304 98304 sha256 $ROOT_HASH $SALT"
+          # ====================== 修正的 dm-verity 参数 ======================
+          # length 必须是 512 字节扇区数，不是 4K block 数
+          # hash_start_block 是 vdc 上的 block 偏移，从 0 开始
+          DATA_BLOCKS=$((384 * 256))
+          DATA_SECTORS=$((DATA_BLOCKS * 8))
+          DM="system,,,ro,0 $DATA_SECTORS verity 1 /dev/vdb /dev/vdc 4096 4096 $DATA_BLOCKS 0 sha256 $ROOT_HASH $SALT"
+          # =================================================================
           CMDLINE="console=ttyS0,115200 rdinit=/init loglevel=7 panic=10 root=/dev/dm-0 dm-mod.create=\"$DM\""
+          echo ">>> CMDLINE: $CMDLINE"
           scripts/config --enable CMDLINE_BOOL
           scripts/config --set-str CMDLINE "$CMDLINE"
           scripts/config --enable CMDLINE_OVERRIDE
@@ -767,5 +1002,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tiny-linux-tpm-duress
+          name: tiny-linux-tpm-duress-9games
           path: out/

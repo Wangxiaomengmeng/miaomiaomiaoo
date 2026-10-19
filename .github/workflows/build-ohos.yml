@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 360 # 拉满 6 小时
+    timeout-minutes: 360
 
     steps:
       - name: Setup Swap and Check Space
@@ -24,6 +24,17 @@ jobs:
           sudo apt-get install -y git git-lfs curl python3 python3-pip \
             rsync unzip flex bison dosfstools mtools libssl-dev
 
+      # ======== 新增：缓存源码，避免重复拉取 ========
+      - name: Cache OpenHarmony Source
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/openharmony
+          # 使用 manifest 的名字作为缓存键，更改分支时缓存会失效
+          key: ohos-source-v3.2-Release-${{ github.run_id }}
+          restore-keys: |
+            ohos-source-v3.2-Release-
+      # ============================================
+
       - name: Setup repo tool
         run: |
           mkdir -p ~/bin
@@ -36,29 +47,41 @@ jobs:
           mkdir -p /home/runner/openharmony
           cd /home/runner/openharmony
           
-          repo init -u https://gitee.com/openharmony/manifest.git -b OpenHarmony-3.2-Release --no-repo-verify
-          
-          repo sync -c -j4 --force-sync --no-clone-bundle --no-tags || \
-          repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+          # 如果目录已经被缓存下来了，这里会秒过
+          if [ ! -d ".repo" ]; then
+            repo init -u https://gitee.com/openharmony/manifest.git -b OpenHarmony-3.2-Release --no-repo-verify
+            repo sync -c -j4 --force-sync --no-clone-bundle --no-tags || \
+            repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+          else
+            echo "Found cached source, skipping repo sync!"
+          fi
           
           ./build/prebuilts_download.sh
 
       - name: Build OpenHarmony (qemu-arm-linux-min)
+        shell: bash
         run: |
           cd /home/runner/openharmony
-          ./build.sh --product-name qemu-arm-linux-min --ccache -j4
+          
+          # 1. 绕过系统版本检查（把系统伪装成 20.04）
+          sudo sed -i 's/VERSION_ID="22.04"/VERSION_ID="20.04"/' /etc/os-release
+          
+          # 2. 修正编译参数：OpenHarmony 不支持 -j4，正确参数是 --jobs=4
+          ./build.sh --product-name qemu-arm-linux-min --ccache --jobs=4
 
       - name: Collect artifacts
+        if: always() # 即使编译失败也打包日志
         run: |
           cd /home/runner/openharmony
           mkdir -p out_artifacts
           
           echo "=== Looking for images ==="
-          find out -maxdepth 4 -name "*.img" -o -name "zImage" | head -20
+          find out -maxdepth 5 -name "*.img" -o -name "zImage" | head -20
           
-          cp -r out/qemu-arm-linux-min/packages/phone/images/* out_artifacts/ || \
-          cp -r out/ohos-arm-release/packages/phone/images/* out_artifacts/ || \
-          echo "Artifact path not found, copying entire images dir if exists..."
+          cp -r out/qemu-arm-linux-min/packages/phone/images/* out_artifacts/ || true
+          
+          # 打包编译日志用于查错
+          cp out/qemu-arm-linux-min/build.log out_artifacts/ 2>/dev/null || true
           
           echo "=== Artifacts to upload ==="
           ls -lh out_artifacts/

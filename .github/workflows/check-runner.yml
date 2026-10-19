@@ -1,0 +1,60 @@
+name: Check Runner Specs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: System info
+        run: |
+          echo "========== OS =========="
+          cat /etc/os-release | head -5
+          uname -a
+
+          echo ""
+          echo "========== CPU =========="
+          nproc
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket'
+
+          echo ""
+          echo "========== MEMORY =========="
+          free -h
+          echo "--- swap ---"
+          swapon --show || echo "no swap"
+
+          echo ""
+          echo "========== DISK =========="
+          df -h
+          echo "--- 根分区剩余空间 ---"
+          df -h / | tail -1 | awk '{print $4}'
+
+          echo ""
+          echo "========== RUNNER ENV =========="
+          echo "Runner name: $RUNNER_NAME"
+          echo "Runner OS:   $RUNNER_OS"
+          echo "Workspace:   $GITHUB_WORKSPACE"
+
+      - name: Check tools
+        run: |
+          echo "=== 已安装的关键工具 ==="
+          for t in gcc g++ make cmake ninja python3 node java docker git; do
+            if command -v $t >/dev/null 2>&1; then
+              echo "$t: $(command -v $t)"
+            else
+              echo "$t: NOT FOUND"
+            fi
+          done
+
+      - name: Disk usage of preinstalled tools
+        run: |
+          echo "=== 哪些目录占用最多（用于判断能删多少） ==="
+          sudo du -sh /usr/share/dotnet 2>/dev/null || true
+          sudo du -sh /usr/local/lib/android 2>/dev/null || true
+          sudo du -sh /opt/ghc 2>/dev/null || true
+          sudo du -sh /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo du -sh /usr/local/.ghcup 2>/dev/null || true
+          echo "--- Docker images ---"
+          docker images 2>/dev/null | head -10 || echo "no docker"

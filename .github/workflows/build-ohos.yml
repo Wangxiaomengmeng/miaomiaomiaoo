@@ -9,15 +9,17 @@ jobs:
     timeout-minutes: 360 # 拉满 6 小时
 
     steps:
-      - name: Maximize build space (清理无用软件)
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 2048
-          temp-reserve-mb: 2048
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+      - name: Setup Swap and Check Space
+        run: |
+          # 打印一下当前空间
+          df -h /
+          
+          # 增加 8G Swap 防止编译时内存溢出被系统强杀（OOM）
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
 
       - name: Install dependencies
         run: |
@@ -37,30 +39,38 @@ jobs:
           mkdir -p /home/runner/openharmony
           cd /home/runner/openharmony
           
-          # 使用 3.2 Release 分支，比较稳定
+          # 同步代码
           repo init -u https://gitee.com/openharmony/manifest.git -b OpenHarmony-3.2-Release --no-repo-verify
           
-          # 同步代码（加 --fail-fast 防止卡死，如果失败会自动重试一次）
+          # -j4 并发拉取，极容易断，加上重试逻辑
           repo sync -c -j4 --force-sync --no-clone-bundle --no-tags || \
           repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
           
-          # 下载预编译工具链（大约 2GB）
+          # 下载预编译工具链
           ./build/prebuilts_download.sh
 
-      - name: Build OpenHarmony (Small System - QEMU)
+      - name: Build OpenHarmony (qemu-arm-linux-min)
         run: |
           cd /home/runner/openharmony
-          # 编译 QEMU 运行的 arm 模拟器版本 (小型系统)
-          # 注意：-j4 不要开太大，防止内存爆掉
+          # qemu-arm-linux-min 是带 LiteOS-A 内核和基础图形的最小系统，专门用来在 QEMU 跑
+          # 使用 -j4 并行编译，如果内存吃紧，改成 -j2
           ./build.sh --product-name qemu-arm-linux-min --ccache -j4
 
       - name: Collect artifacts
         run: |
+          cd /home/runner/openharmony
           mkdir -p out_artifacts
-          # qemu-arm-linux-min 的产物路径
-          cp -r /home/runner/openharmony/out/qemu-arm-linux-min/packages/phone/images/* out_artifacts/ || \
-          echo "Artifact path not found, checking..."
           
+          # 查找产物路径
+          echo "=== Looking for images ==="
+          find out -maxdepth 4 -name "*.img" -o -name "zImage" | head -20
+          
+          # 打包产物
+          cp -r out/qemu-arm-linux-min/packages/phone/images/* out_artifacts/ || \
+          cp -r out/ohos-arm-release/packages/phone/images/* out_artifacts/ || \
+          echo "Artifact path not found, copying entire images dir if exists..."
+          
+          echo "=== Artifacts to upload ==="
           ls -lh out_artifacts/
 
       - uses: actions/upload-artifact@v4

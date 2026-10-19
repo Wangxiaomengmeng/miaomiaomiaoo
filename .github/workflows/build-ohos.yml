@@ -11,14 +11,11 @@ jobs:
     steps:
       - name: Setup Swap and Check Space
         run: |
-          # 打印一下当前空间
           df -h /
-          
-          # 增加 8G Swap 防止编译时内存溢出被系统强杀（OOM）
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 8G /swapfile2 || sudo dd if=/dev/zero of=/swapfile2 bs=1M count=8192
+          sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2
+          sudo swapon /swapfile2
           free -h
 
       - name: Install dependencies
@@ -39,21 +36,16 @@ jobs:
           mkdir -p /home/runner/openharmony
           cd /home/runner/openharmony
           
-          # 同步代码
           repo init -u https://gitee.com/openharmony/manifest.git -b OpenHarmony-3.2-Release --no-repo-verify
           
-          # -j4 并发拉取，极容易断，加上重试逻辑
           repo sync -c -j4 --force-sync --no-clone-bundle --no-tags || \
           repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
           
-          # 下载预编译工具链
           ./build/prebuilts_download.sh
 
       - name: Build OpenHarmony (qemu-arm-linux-min)
         run: |
           cd /home/runner/openharmony
-          # qemu-arm-linux-min 是带 LiteOS-A 内核和基础图形的最小系统，专门用来在 QEMU 跑
-          # 使用 -j4 并行编译，如果内存吃紧，改成 -j2
           ./build.sh --product-name qemu-arm-linux-min --ccache -j4
 
       - name: Collect artifacts
@@ -61,11 +53,9 @@ jobs:
           cd /home/runner/openharmony
           mkdir -p out_artifacts
           
-          # 查找产物路径
           echo "=== Looking for images ==="
           find out -maxdepth 4 -name "*.img" -o -name "zImage" | head -20
           
-          # 打包产物
           cp -r out/qemu-arm-linux-min/packages/phone/images/* out_artifacts/ || \
           cp -r out/ohos-arm-release/packages/phone/images/* out_artifacts/ || \
           echo "Artifact path not found, copying entire images dir if exists..."

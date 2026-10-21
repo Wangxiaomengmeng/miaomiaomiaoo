@@ -68,8 +68,8 @@ jobs:
           # 修正编译参数：OpenHarmony 不支持 -j4，正确参数是 --jobs=4
           ./build.sh --product-name qemu-arm-linux-min --ccache --jobs=4
 
-      # ======== 修复后的产物收集：暴力搜索 ========
-      - name: Collect artifacts
+      # ======== 终极修复：打包并绝对路径上传 ========
+      - name: Collect and Pack artifacts
         if: always()
         run: |
           cd /home/runner/openharmony
@@ -79,17 +79,21 @@ jobs:
           # 暴力搜刮所有的镜像、内核和二进制
           find out -name "*.img" -exec cp {} out_artifacts/ \;
           find out -name "zImage*" -exec cp {} out_artifacts/ \;
-          find out -name "OHOS_Image.bin" -exec cp {} out_artifacts/ \;
           find out -name "uImage" -exec cp {} out_artifacts/ \;
           
           # 带上编译日志
           cp out/qemu-arm-linux/build.log out_artifacts/ 2>/dev/null || true
           
-          echo "=== Artifacts ready ==="
-          ls -lh out_artifacts/
+          # 将整个目录打包成一个单独的 tar.gz 文件，防止散装文件上传失败
+          cd out_artifacts
+          tar -czvf ../ohos-qemu.tar.gz *
+          
+          echo "=== Packed Artifact ready ==="
+          ls -lh ../ohos-qemu.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ohos-qemu-images
-          path: out_artifacts/
+          name: ohos-images-tar
+          # 这里使用绝对路径，确保一定能找到文件！
+          path: /home/runner/openharmony/ohos-qemu.tar.gz
       # ============================================
